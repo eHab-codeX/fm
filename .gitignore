@@ -1,0 +1,4 @@
+*.swp
+*.tmp
+.fm-tmp.*
+.DS_Store

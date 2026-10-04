@@ -1,0 +1,2453 @@
+#!/usr/bin/env bash
+# fm — fzf-based file manager: eza icons, cached Kitty thumbnails, zoxide,
+#      gallery grid, trash browser with undo history.
+# Usage: fm [start_directory | file | zoxide-query...]
+#        fm --grid [dir]      standalone full-screen gallery (prints the
+#                             picked file on stdout when you press 'f')
+#
+# Press F1 (or Alt-H) inside fm for the full key map.
+
+set -o pipefail
+
+if ((BASH_VERSINFO[0] < 5)); then
+  echo "fm: bash >= 5 required (uses EPOCHREALTIME, \${var,,})" >&2
+  exit 1
+fi
+
+# ==========================================================================
+#  Config
+# ==========================================================================
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fm"
+THUMB_DIR="$CACHE_DIR/thumbs"
+GALLERY_DIR="$CACHE_DIR/gallery"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fm"
+UNDO_DIR="$STATE_DIR/undo"
+UNDO_MAX=10
+
+CACHE_DAYS=30
+THUMB_SIZE=1024
+GRID_SIZE=384
+GRID_CELL_W=28
+
+TRASH="trash-put"
+BOOKMARKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fm"
+BOOKMARKS_FILE="$BOOKMARKS_DIR/bookmarks"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+TRASH_FILES="$DATA_HOME/Trash/files"
+TRASH_INFO="$DATA_HOME/Trash/info"
+
+MAX_DEPTH=1
+SHOW_HIDDEN=1
+SORT_MODE="name"
+ADD_LABEL="➕ Add current directory"
+FOCUS_NAME=""
+
+GALLERY_FIND=(
+  '(' -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif'
+  -o -iname '*.webp' -o -iname '*.bmp' -o -iname '*.tif' -o -iname '*.tiff'
+  -o -iname '*.avif' -o -iname '*.heic' -o -iname '*.svg'
+  -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov'
+  -o -iname '*.pdf'
+  -o -iname '*.md' -o -iname '*.markdown'
+  ')'
+)
+mkdir -p "$THUMB_DIR" "$GALLERY_DIR" "$BOOKMARKS_DIR" "$STATE_DIR" "$UNDO_DIR"
+
+# ==========================================================================
+#  Shared helpers
+# ==========================================================================
+_have() { command -v "$1" >/dev/null 2>&1; }
+
+if _have kitten; then
+  ICAT=(kitten icat)
+elif _have kitty; then
+  ICAT=(kitty +kitten icat)
+else ICAT=(); fi
+
+_in_kitty() { ((${#ICAT[@]})) && [[ -n "$KITTY_WINDOW_ID" || "$TERM" == xterm-kitty ]]; }
+_gflag() { printf '%s/gallery.%s' "$CACHE_DIR" "${FM_MAIN_PID:-0}"; }
+_pause() {
+  printf '%s\n' "$1" >&2
+  sleep "${2:-1.2}"
+}
+
+# Must go to the tty, never stdout: it is called inside $(...) captures
+# (e.g. _pick_dest) and would otherwise be glued onto the captured value.
+_cleanup_kitty() { printf '\e_Ga=d,d=A\e\\' 2>/dev/null >/dev/tty; }
+
+_workers() {
+  local n
+  n=$(nproc 2>/dev/null) || n=4
+  [[ "$n" =~ ^[0-9]+$ ]] || n=4
+  ((n < 2)) && n=2
+  ((n > 8)) && n=8
+  printf '%s' "$n"
+}
+
+_convert() { if _have magick; then magick "$@"; else convert "$@"; fi; }
+
+# Ask the terminal for its cell size in pixels (CSI 16 t) and export it, so
+# image canvases can be built to match the preview/grid geometry exactly.
+_probe_cell() {
+  [[ "${FM_CELL_W:-}" =~ ^[0-9]+$ && "${FM_CELL_H:-}" =~ ^[0-9]+$ ]] && return 0
+  _in_kitty || return 1
+  [[ -r /dev/tty ]] || return 1
+  local old reply h w
+  old=$(stty -g </dev/tty 2>/dev/null) || return 1
+  stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
+  printf '\e[16t' >/dev/tty
+  IFS= read -rs -d t -t 0.3 reply </dev/tty
+  stty "$old" </dev/tty 2>/dev/null
+  reply="${reply##*\[6;}"
+  IFS=';' read -r h w <<<"$reply"
+  if [[ "$h" =~ ^[0-9]+$ && "$w" =~ ^[0-9]+$ ]] && ((h > 0 && w > 0)); then
+    export FM_CELL_H="$h" FM_CELL_W="$w"
+    return 0
+  fi
+  return 1
+}
+
+# Freedesktop trash uses percent-encoding for Path= entries.
+_url_encode() {
+  local LC_ALL=C in="$1" out='' c i
+  for ((i = 0; i < ${#in}; i++)); do
+    c="${in:i:1}"
+    if [[ "$c" == [a-zA-Z0-9-._~/] ]]; then
+      out+="$c"
+    else
+      printf -v c '%02X' "'$c"
+      out+="%$c"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# _url_decode_var VAR STRING  (no subshell, backslash-safe)
+_url_decode_var() {
+  local s="${2//\\/\\\\}"
+  s="${s//%/\\x}"
+  printf -v "$1" '%b' "$s"
+}
+
+_tilde() {
+  local p="$1"
+  if [[ "$p" == "$HOME" ]]; then
+    printf '~'
+  elif [[ "$p" == "$HOME"/* ]]; then
+    printf '~/%s' "${p#"$HOME"/}"
+  else printf '%s' "$p"; fi
+}
+
+# Absolute path WITHOUT resolving the final component (so symlinks stay
+# symlinks — `readlink -f` would resolve to the link target).
+_abs_nofollow() {
+  local p="${1%/}" d
+  [[ -z "$p" ]] && { printf '/'; return 0; } # "/" itself
+  [[ "$p" == */* ]] || p="./$p"
+  d="${p%/*}"
+  [[ -z "$d" ]] && d="/" # top-level absolute path such as /foo
+  d=$(cd -P -- "$d" 2>/dev/null && pwd -P) || return 1
+  if [[ "$d" == "/" ]]; then printf '/%s' "${p##*/}"; else printf '%s/%s' "$d" "${p##*/}"; fi
+}
+
+_clipboard() {
+  if _have wl-copy; then
+    wl-copy
+  elif _have xclip; then
+    xclip -selection clipboard
+  else
+    cat >/dev/null
+    return 1
+  fi
+}
+
+_launch() {
+  _have xdg-open || {
+    _pause "xdg-open not found"
+    return 1
+  }
+  if _have setsid; then
+    setsid -f xdg-open "$1" >/dev/null 2>&1
+  else
+    xdg-open "$1" >/dev/null 2>&1 &
+  fi
+}
+
+# _open_at FILE [LINE] — open in $EDITOR, jumping to LINE when supported.
+_open_at() {
+  local f="$1" line="${2:-}"
+  local -a ed
+  read -ra ed <<<"${EDITOR:-vi}"
+  [[ "$f" == -* ]] && f="./$f"
+  case "${ed[0]##*/}" in
+  nvim | vim | vi | emacs | nano)
+    if [[ "$line" =~ ^[0-9]+$ ]]; then "${ed[@]}" "+$line" "$f"; else "${ed[@]}" "$f"; fi
+    ;;
+  *) "${ed[@]}" "$f" ;;
+  esac
+}
+
+_file_kind() {
+  local f="$1" mime
+  case "${f,,}" in
+  *.md | *.markdown)
+    echo "md"
+    return
+    ;;
+  *.pdf)
+    echo "pdf"
+    return
+    ;;
+  esac
+  mime=$(file --mime-type -b -- "$f" 2>/dev/null)
+  case "$mime" in
+  image/*) echo "image" ;;
+  video/*) echo "video" ;;
+  application/pdf) echo "pdf" ;;
+  *) echo "" ;;
+  esac
+}
+
+# ==========================================================================
+#  Trash with undo history stack
+# ==========================================================================
+_undo_depth() {
+  local n=0
+  [[ -f "$UNDO_DIR/depth" ]] && read -r n <"$UNDO_DIR/depth"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s\n' "$n"
+}
+
+_undo_set_depth() { printf '%s\n' "$1" >"$UNDO_DIR/depth"; }
+
+_undo_push() {
+  local src="$1"
+  [[ -s "$src" ]] || return 1
+  local n
+  n=$(_undo_depth)
+  n=$((n + 1))
+  mv -- "$src" "$UNDO_DIR/stack.$n"
+  _undo_set_depth "$n"
+  local cutoff=$((n - UNDO_MAX))
+  local i
+  for ((i = 1; i <= cutoff; i++)); do
+    rm -f -- "$UNDO_DIR/stack.$i"
+  done
+}
+
+_undo_peek() {
+  local n
+  n=$(_undo_depth)
+  ((n > 0)) || return 1
+  local f="$UNDO_DIR/stack.$n"
+  [[ -f "$f" ]] || return 1
+  printf '%s\n' "$f"
+}
+
+_undo_pop_apply() {
+  local batch
+  batch=$(_undo_peek)
+  if [[ -z "$batch" ]]; then
+    (($(_undo_depth) > 0)) && _undo_set_depth 0
+    _pause "Nothing to undo."
+    return 1
+  fi
+
+  local n=0 fail=0 abs base src
+  while IFS=$'\t' read -r abs base; do
+    [[ -z "$base" ]] && continue
+    src="$TRASH_FILES/$base"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+      _pause "Missing from trash: $base"
+      ((fail++))
+      continue
+    fi
+    if [[ -e "$abs" || -L "$abs" ]]; then
+      _pause "Skipping (exists): $abs"
+      ((fail++))
+      continue
+    fi
+    mkdir -p -- "$(dirname -- "$abs")"
+    if mv -- "$src" "$abs" 2>/dev/null; then
+      rm -f -- "$TRASH_INFO/$base.trashinfo"
+      ((n++))
+    else
+      _pause "Could not restore: $abs"
+      ((fail++))
+    fi
+  done <"$batch"
+
+  rm -f -- "$batch"
+  local cur
+  cur=$(_undo_depth)
+  cur=$((cur - 1))
+  _undo_set_depth "$cur"
+
+  if ((fail == 0)); then
+    _pause "Restored $n item(s). Depth now $cur." 1
+  else
+    _pause "Restored $n; $fail skipped. Depth now $cur." 1.4
+  fi
+}
+
+_human() {
+  local b="$1"
+  numfmt --to=iec --suffix=B "$b" 2>/dev/null || echo "${b}B"
+}
+
+_trash_size_bytes() {
+  local total=0
+  if [[ -d "$TRASH_FILES" ]]; then
+    total=$(du -sb -- "$TRASH_FILES" 2>/dev/null | awk '{print $1}')
+    if [[ -z "$total" || "$total" == "0" ]]; then
+      total=$(du -sk -- "$TRASH_FILES" 2>/dev/null | awk '{print $1*1024}')
+    fi
+  fi
+  printf '%s\n' "${total:-0}"
+}
+
+# Parse a .trashinfo without forking: sets TI_PATH (decoded) and TI_DATE.
+_ti_read() {
+  TI_PATH="" TI_DATE=""
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+    Path=*) [[ -z "$TI_PATH" ]] && _url_decode_var TI_PATH "${line#Path=}" ;;
+    DeletionDate=*) TI_DATE="${line#DeletionDate=}" ;;
+    esac
+  done <"$1"
+}
+
+# Newest .trashinfo whose Path= matches the absolute path $1.
+_find_trashinfo() {
+  local abs="$1" enc info
+  enc=$(_url_encode "$abs")
+  info=$(grep -lxF -e "Path=$enc" -- "$TRASH_INFO"/*.trashinfo 2>/dev/null |
+    xargs -r -d '\n' ls -t -- 2>/dev/null | head -1)
+  if [[ -z "$info" ]]; then
+    info=$(grep -lxF -e "Path=$abs" -- "$TRASH_INFO"/*.trashinfo 2>/dev/null |
+      xargs -r -d '\n' ls -t -- 2>/dev/null | head -1)
+  fi
+  printf '%s' "$info"
+}
+
+_trash_one() {
+  if _have "$TRASH"; then
+    "$TRASH" -- "$1"
+  elif _have gio; then
+    gio trash -- "$1"
+  else
+    return 2
+  fi
+}
+
+_trash_and_record() {
+  local -a targets=("$@")
+  ((${#targets[@]})) || return 0
+
+  local tmp
+  tmp=$(mktemp)
+  local n=0 f abs info base
+  for f in "${targets[@]}"; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    abs=$(_abs_nofollow "$f") || continue
+
+    if _have "$TRASH" || _have gio; then
+      _trash_one "$abs" || {
+        _pause "Failed to trash: $f"
+        continue
+      }
+    else
+      rm -ri -- "$abs" && ((++n)) || true
+      continue
+    fi
+
+    info=$(_find_trashinfo "$abs")
+    if [[ -n "$info" ]]; then
+      base=$(basename -- "$info" .trashinfo)
+      printf '%s\t%s\n' "$abs" "$base" >>"$tmp"
+      ((++n))
+    fi
+  done
+
+  if [[ -s "$tmp" ]]; then
+    _undo_push "$tmp"
+    local depth
+    depth=$(_undo_depth)
+    _pause "Trashed $n item(s). Ctrl-z to undo (depth $depth)." 0.8
+  else
+    rm -f -- "$tmp"
+  fi
+}
+
+_preview_trash() {
+  local base="$1"
+  local src="$TRASH_FILES/$base"
+  if [[ ! -e "$src" && ! -L "$src" ]]; then
+    echo "[missing from trash]"
+    return 0
+  fi
+  _preview "$src"
+}
+
+_trash_browser() {
+  local files_dir="$TRASH_FILES" info_dir="$TRASH_INFO"
+  [[ -d "$files_dir" && -d "$info_dir" ]] || {
+    _pause "No trash on this system"
+    return 0
+  }
+
+  local info base entries
+  entries=$(
+    for info in "$info_dir"/*.trashinfo; do
+      [[ -f "$info" ]] || continue
+      base="${info##*/}"
+      base="${base%.trashinfo}"
+      [[ -e "$files_dir/$base" || -L "$files_dir/$base" ]] || continue
+      _ti_read "$info"
+      printf '%s\t%s  %s\n' "$base" "$TI_DATE" "$TI_PATH"
+    done | sort -t$'\t' -k2,2 -r
+  )
+
+  [[ -z "$entries" ]] && {
+    _pause "Trash is empty"
+    return 0
+  }
+
+  local sz
+  sz=$(_human "$(_trash_size_bytes)")
+  local count
+  count=$(printf '%s\n' "$entries" | wc -l)
+
+  local selection
+  selection=$(
+    printf '%s\n' "$entries" | FZF_DEFAULT_OPTS='' fzf \
+      --height 70% --layout reverse --border --ansi \
+      --delimiter=$'\t' --with-nth=2 \
+      --prompt "Trash ($count items, $sz) > " \
+      --preview "$RUN --preview-trash {1}" \
+      --preview-window 'right:60%:wrap' \
+      "${PREVIEW_BINDS[@]}" \
+      --expect='ctrl-d,ctrl-y,ctrl-x,ctrl-f' \
+      --multi \
+      --header 'Enter:restore  C-d:delete permanently  C-y:copy paths  C-f:search inside  C-x:empty trash  Esc:cancel'
+  )
+  _cleanup_kitty
+  [[ -z "$selection" ]] && return 0
+
+  local key
+  key=$(head -1 <<<"$selection")
+  local bases
+  bases=$(tail -n +2 <<<"$selection" | cut -f1)
+
+  case "$key" in
+  ctrl-f)
+    _trash_search
+    return 0
+    ;;
+  ctrl-x)
+    read -r -p "Permanently empty the ENTIRE trash ($sz)? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if _have trash-empty; then
+      trash-empty -f && _pause "Trash emptied" 0.8
+    else
+      rm -rf -- "${files_dir:?}"/* "${info_dir:?}"/*.trashinfo 2>/dev/null
+      _pause "Trash emptied" 0.8
+    fi
+    return 0
+    ;;
+  ctrl-d)
+    local cnt
+    cnt=$(printf '%s\n' "$bases" | wc -l)
+    read -r -p "Permanently delete $cnt item(s)? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    local n=0
+    while IFS= read -r base; do
+      [[ -z "$base" ]] && continue
+      rm -rf -- "${files_dir:?}/${base:?}" "${info_dir:?}/${base:?}.trashinfo" 2>/dev/null && ((n++))
+    done <<<"$bases"
+    _pause "Permanently deleted $n item(s)" 0.8
+    return 0
+    ;;
+  ctrl-y)
+    while IFS= read -r base; do
+      [[ -z "$base" ]] && continue
+      _ti_read "$info_dir/$base.trashinfo" 2>/dev/null
+      [[ -n "$TI_PATH" ]] && printf '%s\n' "$TI_PATH"
+    done <<<"$bases" | _clipboard
+    _pause "Copied original path(s)" 0.6
+    return 0
+    ;;
+  esac
+
+  local n=0 fail=0 src path
+  while IFS= read -r base; do
+    [[ -z "$base" ]] && continue
+    src="$files_dir/$base"
+    _ti_read "$info_dir/$base.trashinfo" 2>/dev/null
+    path="$TI_PATH"
+    if [[ -z "$path" ]]; then
+      _pause "No metadata for: $base"
+      ((fail++))
+      continue
+    fi
+    if [[ -e "$path" || -L "$path" ]]; then
+      _pause "Exists: $path"
+      ((fail++))
+      continue
+    fi
+    mkdir -p -- "$(dirname -- "$path")"
+    if mv -- "$src" "$path" 2>/dev/null; then
+      rm -f -- "$info_dir/$base.trashinfo"
+      ((n++))
+    else
+      _pause "Could not restore: $path"
+      ((fail++))
+    fi
+  done <<<"$bases"
+
+  if ((fail == 0)); then
+    _pause "Restored $n item(s)" 1
+  else
+    _pause "Restored $n; $fail skipped" 1.4
+  fi
+}
+
+# Split an rg --null hit ("path<US>line:text") — safe for ':' in file names.
+_rg_split() { # sets RG_FILE RG_LINE
+  RG_FILE="${1%%$'\037'*}"
+  local rest="${1#*$'\037'}"
+  RG_LINE="${rest%%:*}"
+}
+
+_trash_search() {
+  _have rg || {
+    _pause "ripgrep (rg) is required"
+    return 1
+  }
+  [[ -d "$TRASH_FILES" ]] || {
+    _pause "Empty trash"
+    return 0
+  }
+
+  local result
+  result=$(
+    rg --null --with-filename --line-number --no-heading --color=always --smart-case \
+      --max-columns=200 --max-columns-preview --max-filesize 5M \
+      '' -- "$TRASH_FILES" 2>/dev/null | tr '\0' '\037' |
+      FZF_DEFAULT_OPTS='' fzf \
+        --ansi --delimiter=$'\037' --nth=1,2 \
+        --height 80% --layout reverse --border \
+        --preview "$RUN --preview-line {1} {2}" \
+        --preview-window 'right:60%:wrap' \
+        --bind 'ctrl-v:preview-page-down,ctrl-u:preview-page-up' \
+        "${PICKER_MOUSE[@]}" \
+        --header 'Search trashed files  Enter: view in $EDITOR  Esc: cancel'
+  )
+  _cleanup_kitty
+  [[ -z "$result" ]] && return 0
+  _rg_split "$result"
+  _open_at "$RG_FILE" "$RG_LINE"
+}
+
+# ==========================================================================
+#  Bulk rename, content search
+# ==========================================================================
+_bulk_rename() {
+  local -a files=("$@")
+  ((${#files[@]})) || return 1
+  local tmp
+  tmp=$(mktemp)
+  printf '%s\n' "${files[@]}" >"$tmp"
+  local -a ed
+  read -ra ed <<<"${EDITOR:-vi}"
+  "${ed[@]}" "$tmp"
+  local -a newnames=()
+  mapfile -t newnames <"$tmp"
+  rm -f "$tmp"
+  if ((${#newnames[@]} != ${#files[@]})); then
+    _pause "Line count changed; nothing renamed."
+    return 1
+  fi
+
+  # Plan: collect real renames, validate targets, then rename in two phases
+  # (old -> temp -> new) so swaps and chains (a->b, b->c) work.
+  local -A moving=() taken=()
+  local -a ro=() rn=()
+  local i k old new
+  for i in "${!files[@]}"; do
+    old="${files[i]}"
+    new="${newnames[i]:-}"
+    [[ -z "$new" || "$new" == "$old" ]] && continue
+    moving[$old]=1
+    ro+=("$old")
+    rn+=("$new")
+  done
+  ((${#ro[@]})) || return 0
+
+  for k in "${!ro[@]}"; do
+    new="${rn[k]}"
+    if [[ -n "${taken[$new]:-}" ]]; then
+      _pause "Skip (duplicate target): $new"
+      rn[k]=""
+      continue
+    fi
+    if [[ (-e "$new" || -L "$new") && -z "${moving[$new]:-}" ]]; then
+      _pause "Skip (exists): $new"
+      rn[k]=""
+      continue
+    fi
+    taken[$new]=1
+  done
+
+  for k in "${!ro[@]}"; do
+    [[ -z "${rn[k]}" ]] && continue
+    if ! mv -T -- "${ro[k]}" "${ro[k]}.fm-tmp.$$"; then
+      _pause "Rename failed: ${ro[k]}"
+      rn[k]=""
+    fi
+  done
+  for k in "${!ro[@]}"; do
+    [[ -z "${rn[k]}" ]] && continue
+    if ! mv -T -- "${ro[k]}.fm-tmp.$$" "${rn[k]}"; then
+      _pause "Rename failed: ${ro[k]} -> ${rn[k]}"
+      mv -T -- "${ro[k]}.fm-tmp.$$" "${ro[k]}" 2>/dev/null
+    fi
+  done
+}
+
+_search_content() {
+  _have rg || {
+    _pause "ripgrep (rg) is required"
+    return 1
+  }
+  local -a targets=()
+  local f
+  for f in "$@"; do [[ -f "$f" ]] && targets+=("$f"); done
+  if ((${#targets[@]} == 0)); then
+    for f in "$@"; do [[ -d "$f" ]] && targets+=("$f"); done
+  fi
+  ((${#targets[@]})) || targets=(.)
+
+  # --with-filename: with a single file rg omits the name, which broke the
+  # file:line:text parsing below.
+  local result
+  result=$(
+    rg --null --with-filename --line-number --no-heading --color=always --smart-case \
+      --max-columns=200 --max-columns-preview \
+      --max-depth 5 \
+      '' -- "${targets[@]}" 2>/dev/null | tr '\0' '\037' |
+      FZF_DEFAULT_OPTS='' fzf \
+        --ansi --delimiter=$'\037' --nth=1,2 \
+        --height 80% --layout reverse --border \
+        --preview "$RUN --preview-line {1} {2}" \
+        --preview-window 'right:60%:wrap' \
+        --bind 'ctrl-v:preview-page-down,ctrl-u:preview-page-up' \
+        "${PICKER_MOUSE[@]}" \
+        --header 'Enter: open at line  C-v/C-u: scroll preview  Esc: cancel'
+  )
+  _cleanup_kitty
+  [[ -z "$result" ]] && return 0
+  _rg_split "$result"
+  _open_at "$RG_FILE" "$RG_LINE"
+}
+
+# Context preview around a hit (used by the rg/fzf pickers). Shell-agnostic:
+# fzf runs preview strings with $SHELL, so keep the logic out of the string.
+_preview_line() {
+  local f="$1" l="${2%%:*}" s e
+  [[ "$l" =~ ^[0-9]+$ ]] || l=1
+  s=$((l > 10 ? l - 10 : 1))
+  e=$((s + 30))
+  [[ -f "$f" ]] || return 0
+  if _have bat; then
+    bat --color=always --style=numbers --highlight-line "$l" \
+      --line-range="$s:$e" -- "$f" 2>/dev/null
+  else
+    awk -v s="$s" -v e="$e" -v l="$l" \
+      'NR>=s && NR<=e { printf "%s%6d  %s\n", (NR==l ? ">" : " "), NR, $0 } NR>e { exit }' <"$f"
+  fi
+}
+
+# ==========================================================================
+#  Thumbnail cache
+# ==========================================================================
+_cache_key() {
+  local f st
+  f=$(readlink -f -- "$1") || return 1
+  st=$(stat -c '%Y-%s' -- "$f") || return 1
+  printf '%s|%s' "$f" "$st" | md5sum | cut -d' ' -f1
+}
+
+_thumb_path() {
+  local key
+  key=$(_cache_key "$1") || return 1
+  printf '%s/%s.%s.png' "$THUMB_DIR" "$key" "$2"
+}
+
+_thumb_image() {
+  local s="${3}x${3}"
+  if _have vipsthumbnail; then
+    vipsthumbnail "$1" -s "${s}>" -o "$2" >/dev/null 2>&1 && [[ -s "$2" ]] && return 0
+  fi
+  if _have magick; then
+    magick "${1}[0]" -auto-orient -thumbnail "${s}>" "$2" >/dev/null 2>&1 && [[ -s "$2" ]] && return 0
+  elif _have convert; then
+    convert "${1}[0]" -auto-orient -thumbnail "${s}>" "$2" >/dev/null 2>&1 && [[ -s "$2" ]] && return 0
+  fi
+  if _have ffmpeg; then
+    ffmpeg -nostdin -v error -i "$1" -frames:v 1 -vf "scale='min($3,iw)':-2" -y "$2" >/dev/null 2>&1
+  fi
+}
+
+_thumb_video() {
+  if _have ffmpegthumbnailer; then
+    ffmpegthumbnailer -i "$1" -o "$2" -s "$3" -c png >/dev/null 2>&1 && [[ -s "$2" ]] && return 0
+  fi
+  if _have ffmpeg; then
+    ffmpeg -nostdin -v error -ss 3 -i "$1" -frames:v 1 -vf "scale='min($3,iw)':-2" -y "$2" >/dev/null 2>&1
+    [[ -s "$2" ]] && return 0
+    ffmpeg -nostdin -v error -i "$1" -frames:v 1 -vf "scale='min($3,iw)':-2" -y "$2" >/dev/null 2>&1
+  fi
+}
+
+_thumb_pdf() {
+  _have pdftoppm || return 1
+  pdftoppm -png -f 1 -l 1 -singlefile -scale-to "$3" "$1" "${2%.png}" >/dev/null 2>&1
+}
+
+_md_excerpt() {
+  local src="$1" out=""
+  if _have bat; then
+    out=$(bat --color=never --style=plain --terminal-width=100 --line-range=:40 "$src" 2>/dev/null)
+  fi
+  if [[ -z "$out" ]] && _have mdcat; then
+    out=$(mdcat --no-colour "$src" 2>/dev/null | head -40)
+  fi
+  if [[ -z "$out" ]] && _have glow; then
+    out=$(glow --style dark --width 100 "$src" 2>/dev/null |
+      sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | head -40)
+  fi
+  if [[ -z "$out" ]]; then out=$(head -c 4096 "$src" 2>/dev/null); fi
+  printf '%s' "$out"
+}
+
+_thumb_md() {
+  local src="$1" tmp="$2" size="$3" txt
+  local -a cmd
+  if _have magick; then
+    cmd=(magick)
+  elif _have convert; then
+    cmd=(convert)
+  else
+    return 1
+  fi
+  txt=$(_md_excerpt "$src")
+  [[ -n "$txt" ]] || return 1
+  # Pass the text via argv rather than caption:@file — the stock ImageMagick
+  # policy on Debian/Ubuntu blocks "@*" paths. Escape % (IM format escapes);
+  # the leading space stops a literal leading "@" being read as a file.
+  txt="${txt//%/%%}"
+  "${cmd[@]}" -background '#1a1b26' -fill '#c0caf5' \
+    -font DejaVu-Sans-Mono -pointsize 14 \
+    caption:" $txt" -bordercolor '#1a1b26' -border 20 \
+    -resize "${size}x${size}>" "$tmp" >/dev/null 2>&1
+  local rc=$?
+  [[ -s "$tmp" ]] && return 0
+  return $rc
+}
+
+_make_thumb() {
+  local src="$1" kind="$2" size="${3:-$THUMB_SIZE}" key out tmp base
+  key=$(_cache_key "$src") || return 1
+  out="$THUMB_DIR/$key.$size.png"
+  if [[ -s "$out" ]]; then
+    touch -c -- "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  src=$(readlink -f -- "$src")
+  if [[ "$size" != "$THUMB_SIZE" ]]; then
+    base=$(_make_thumb "$src" "$kind") || return 1
+    src="$base"
+    kind=image
+  fi
+  tmp="$THUMB_DIR/.$key.$size.$$.png"
+  case "$kind" in
+  image) _thumb_image "$src" "$tmp" "$size" ;;
+  video) _thumb_video "$src" "$tmp" "$size" ;;
+  pdf) _thumb_pdf "$src" "$tmp" "$size" ;;
+  md) _thumb_md "$src" "$tmp" "$size" ;;
+  *) return 1 ;;
+  esac
+  if [[ -s "$tmp" ]]; then
+    mv -f -- "$tmp" "$out"
+    printf '%s\n' "$out"
+  else
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+# ==========================================================================
+#  Contact sheet (Ctrl-t preview)
+# ==========================================================================
+_montage() { if _have magick; then magick montage "$@"; else montage "$@"; fi; }
+
+# Build the sheet in the exact pixel shape of the fzf preview pane (so
+# icat fills it edge to edge): tiles are ~square, the grid is sized from the
+# pane, and the last cell row is reserved for a page indicator.
+_contact_layout() {
+  local rows="${FZF_PREVIEW_LINES:-}" cols="${FZF_PREVIEW_COLUMNS:-}"
+  if [[ -z "$rows" || -z "$cols" ]]; then
+    read -r rows cols < <(stty size </dev/tty 2>/dev/null)
+  fi
+  : "${rows:=24}" "${cols:=80}"
+  CS_CW="${FM_CELL_W:-10}" CS_CH="${FM_CELL_H:-20}"
+  CS_W=$((cols * CS_CW))
+  CS_H=$((rows * CS_CH))
+  local img_h=$(((rows - 1) * CS_CH))
+  ((img_h < CS_CH)) && img_h=$CS_CH
+  local ncols=$((cols / 16))
+  ((ncols < 2)) && ncols=2
+  ((ncols > 8)) && ncols=8
+  CS_TW=$((CS_W / ncols))
+  local nrows=$((img_h * 4 / (CS_TW * 3))) # 4:3 tiles suit photos better than squares
+  ((nrows < 1)) && nrows=1
+  ((nrows > 8)) && nrows=8
+  CS_TH=$((img_h / nrows))
+  CONTACT_COLS=$ncols
+  CONTACT_ROWS=$nrows
+  CONTACT_MAX=$((ncols * nrows))
+}
+
+# _gallery DIR [FOCUS_FILE]
+# With FOCUS_FILE (absolute) the sheet jumps to the page containing it
+# whenever the hovered file changes; Alt-j/Alt-k then page from there.
+_gallery() {
+  { _have magick || _have montage; } || return 1
+  local dir focus="${2:-}" f t k key out tmp pf pd pn pl page=0 last="" total pages i have=0
+  local -a items slice args
+  dir=$(readlink -f -- "$1") || return 1
+  mapfile -d '' -t items < <(find "$dir" -maxdepth 1 -type f -not -name '.*' "${GALLERY_FIND[@]}" -print0 2>/dev/null | sort -zV)
+  total=${#items[@]}
+  ((total)) || return 1
+
+  _contact_layout
+  local per_page=$CONTACT_MAX ncols=$CONTACT_COLS nrows=$CONTACT_ROWS
+  pages=$(((total + per_page - 1) / per_page))
+
+  pf="$(_gflag).page"
+  if [[ -f "$pf" ]]; then
+    IFS=$'\t' read -r pd pn pl <"$pf"
+    if [[ "$pd" == "$dir" && "$pn" =~ ^[0-9]+$ ]]; then
+      page=$pn
+      last="$pl"
+    fi
+  fi
+  if [[ -n "$focus" && "$focus" != "$last" ]]; then
+    last="$focus"
+    for ((i = 0; i < total; i++)); do
+      if [[ "${items[i]}" == "$focus" ]]; then
+        page=$((i / per_page))
+        break
+      fi
+    done
+    printf '%s\t%s\t%s\n' "$dir" "$page" "$last" >"$pf"
+  fi
+  if ((page >= pages)); then
+    page=$((pages - 1))
+    printf '%s\t%s\t%s\n' "$dir" "$page" "$last" >"$pf"
+  fi
+  slice=("${items[@]:page*per_page:per_page}")
+
+  key=$({
+    printf '%s\0' "${slice[@]}"
+    stat -c '%Y-%s' -- "${slice[@]}"
+    printf '%s ' "$ncols" "$nrows" "$CS_W" "$CS_H" "$page" "$pages" "$total"
+  } | md5sum | cut -d' ' -f1)
+  out="$GALLERY_DIR/$key.png"
+  if [[ -s "$out" ]]; then
+    touch -c -- "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  local workers
+  workers=$(_workers)
+  printf '%s\0' "${slice[@]}" | xargs -0 -r -n1 -P"$workers" bash "$SELF" --thumb-any
+
+  args=()
+  for f in "${slice[@]}"; do
+    k=$(_file_kind "$f")
+    [[ -z "$k" ]] && k=image
+    if t=$(_make_thumb "$f" "$k" "$GRID_SIZE"); then
+      args+=("$t")
+      have=1
+    else
+      args+=(null:)
+    fi
+  done
+  ((have)) || return 1
+
+  local pad=3 label ps
+  label="page $((page + 1))/$pages  |  $total files  |  Alt-j / Alt-k: next / prev page"
+  ps=$((CS_CH * 7 / 10))
+  ((ps < 10)) && ps=10
+  tmp="$GALLERY_DIR/.$key.$$"
+  _montage -background '#11111b' \
+    -geometry "$((CS_TW - 2 * pad))x$((CS_TH - 2 * pad))+${pad}+${pad}" \
+    -tile "${ncols}x${nrows}" "${args[@]}" "miff:$tmp.miff" >/dev/null 2>&1
+  if [[ ! -s "$tmp.miff" ]]; then
+    rm -f -- "$tmp.miff"
+    return 1
+  fi
+  _convert "miff:$tmp.miff" -background '#11111b' -gravity northwest \
+    -extent "${CS_W}x${CS_H}" -gravity south -fill '#7aa2f7' -pointsize "$ps" \
+    -annotate +0+4 "$label" "png:$tmp.png" >/dev/null 2>&1
+  if [[ ! -s "$tmp.png" ]]; then # no usable font: sheet without the label
+    _convert "miff:$tmp.miff" -background '#11111b' -gravity northwest \
+      -extent "${CS_W}x${CS_H}" "png:$tmp.png" >/dev/null 2>&1
+  fi
+  rm -f -- "$tmp.miff"
+  if [[ -s "$tmp.png" ]]; then
+    mv -f -- "$tmp.png" "$out"
+    printf '%s\n' "$out"
+  else
+    rm -f -- "$tmp.png"
+    return 1
+  fi
+}
+
+_clear_img() { _in_kitty && "${ICAT[@]}" --clear --transfer-mode=memory --stdin=no </dev/null 2>/dev/null; }
+
+_icat() {
+  local cols=${FZF_PREVIEW_COLUMNS:-60} lines=${FZF_PREVIEW_LINES:-20}
+  local left=${FZF_PREVIEW_LEFT:-0} top=${FZF_PREVIEW_TOP:-0}
+  "${ICAT[@]}" --clear --transfer-mode=memory --stdin=no \
+    --place="${cols}x${lines}@${left}x${top}" "$1" </dev/null 2>/dev/null
+}
+
+_preview() {
+  local f="$1" mime enc kind thumb
+  [[ -z "$f" || ! -e "$f" ]] && return 0
+
+  if [[ -d "$f" ]]; then
+    if [[ -e "$(_gflag)" ]] && _in_kitty && thumb=$(_gallery "$f"); then
+      _icat "$thumb"
+      return 0
+    fi
+    _clear_img
+    if _have eza; then
+      eza --tree -L2 --icons=always --color=always --no-quotes ${FM_HYPERLINK:+--hyperlink} -- "$f" 2>/dev/null | head -200
+    else
+      ls -la -- "$f" | head -200
+    fi
+    return 0
+  fi
+
+  kind=$(_file_kind "$f")
+  # gallery toggle on: hovering a viewable FILE shows its directory's sheet
+  # (on the page containing the file), so Alt-j/Alt-k work there too
+  if [[ -n "$kind" && -e "$(_gflag)" ]] && _in_kitty &&
+    thumb=$(_gallery "$(dirname -- "$f")" "$(_abs_nofollow "$f")"); then
+    _icat "$thumb"
+    return 0
+  fi
+  if [[ -n "$kind" ]] && _in_kitty && thumb=$(_make_thumb "$f" "$kind"); then
+    _icat "$thumb"
+    return 0
+  fi
+
+  _clear_img
+  mime=$(file --mime-type -b -- "$f" 2>/dev/null)
+
+  if [[ "$kind" == "md" ]]; then
+    if _have glow; then
+      glow -s dark "$f" 2>/dev/null | head -200
+      return 0
+    elif _have mdcat; then
+      mdcat "$f" 2>/dev/null | head -200
+      return 0
+    fi
+  fi
+
+  enc=$(file --mime-encoding -b -- "$f" 2>/dev/null)
+  if [[ "$enc" != "binary" ]]; then
+    if _have bat; then
+      bat --color=always --style=numbers --line-range=:200 -- "$f" 2>/dev/null
+    else
+      head -n 200 -- "$f"
+    fi
+    return 0
+  fi
+
+  case "$mime" in
+  application/zip | application/x-tar | application/gzip | application/x-xz | application/x-bzip2 | application/x-7z-compressed | application/zstd | application/x-zstd)
+    if _have bsdtar; then
+      bsdtar -tf "$f" 2>/dev/null | head -100
+      return 0
+    fi
+    ;;
+  esac
+  file -b -- "$f"
+  ls -lh -- "$f"
+}
+
+# ==========================================================================
+#  Full-screen gallery grid
+# ==========================================================================
+declare -a G_FILES=() G_THUMB=()
+declare -A G_MARK=()
+G_DIR="" G_N=0 G_NDIRS=0 G_SEL=0 G_TOP=0 G_ROWS=24 G_COLS=80 G_NCOLS=3 G_CW=26 G_CH=15 G_VIS=1
+G_RESIZE=0 G_ACTIVE=0 G_FAST=0 G_NC_FORCE=0 G_SORT=name G_FOCUS="" G_TS=$GRID_SIZE
+GC_W=10 GC_H=20
+GRID_PICK="" KEY="" MX=0 MY=0
+STTY_SAVED=""
+G_DIRICON=$'\uf07b'
+
+# Enter / leave the alternate screen + mouse mode. _grid_leave is idempotent
+# and is also called from the EXIT trap, so Ctrl-C can't leave the terminal
+# in the alt screen with mouse reporting on.
+_grid_enter() {
+  printf '\e[?1049h\e[?25l\e[?1000h\e[?1006h'
+  STTY_SAVED=$(stty -g </dev/tty 2>/dev/null) || STTY_SAVED=""
+  [[ -n "$STTY_SAVED" ]] && stty -icanon -echo min 1 time 0 </dev/tty 2>/dev/null
+  G_ACTIVE=1
+}
+
+_grid_leave() {
+  ((G_ACTIVE)) || return 0
+  G_ACTIVE=0
+  [[ -n "$STTY_SAVED" ]] && stty "$STTY_SAVED" </dev/tty 2>/dev/null
+  printf '\e_Ga=d,d=A\e\\\e[?1000l\e[?1006l\e[?25h\e[?1049l'
+}
+
+_g_layout() {
+  read -r G_ROWS G_COLS < <(stty size </dev/tty 2>/dev/null)
+  : "${G_ROWS:=24}" "${G_COLS:=80}"
+  # "fast" mode = one pre-composed sheet per screen, which needs the real
+  # cell size so the tiles line up with the text rows.
+  G_FAST=0
+  if [[ "${FM_CELL_W:-}" =~ ^[0-9]+$ && "${FM_CELL_H:-}" =~ ^[0-9]+$ ]] &&
+    { _have magick || _have montage; }; then
+    GC_W=$FM_CELL_W GC_H=$FM_CELL_H G_FAST=1
+  fi
+  if ((G_NC_FORCE > 0)); then
+    G_NCOLS=$G_NC_FORCE
+    ((G_NCOLS > 12)) && G_NCOLS=12
+  else
+    G_NCOLS=$((G_COLS / GRID_CELL_W))
+    ((G_NCOLS < 2)) && G_NCOLS=2
+    ((G_NCOLS > 8)) && G_NCOLS=8
+  fi
+  G_CW=$((G_COLS / G_NCOLS))
+  if ((G_FAST)); then G_CH=$((G_CW * GC_W / GC_H + 2)); else G_CH=$((G_CW / 2 + 2)); fi
+  ((G_CH > G_ROWS - 2)) && G_CH=$((G_ROWS - 2))
+  ((G_CH < 4)) && G_CH=4
+  G_VIS=$(((G_ROWS - 2) / G_CH))
+  ((G_VIS < 1)) && G_VIS=1
+  if ((G_CW * GC_W > 340)); then G_TS=$THUMB_SIZE; else G_TS=$GRID_SIZE; fi
+}
+
+# Re-layout after a resize / zoom, keeping the selection on screen.
+_g_relayout() {
+  _g_layout
+  local r=$((G_N ? G_SEL / G_NCOLS : 0)) maxtop=$(((G_N - 1) / G_NCOLS - G_VIS + 1))
+  ((maxtop < 0)) && maxtop=0
+  G_TOP=$((r - G_VIS / 2))
+  ((G_TOP < 0)) && G_TOP=0
+  ((G_TOP > maxtop)) && G_TOP=$maxtop
+  _g_ensure_visible
+  _g_redraw
+}
+
+# Directories first (name order), then viewable files in the chosen order.
+_g_load() {
+  local dir="$1" i
+  local -a dirs=() files=()
+  mapfile -d '' -t dirs < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -not -name '.*' -print0 2>/dev/null | sort -zV)
+  case "$G_SORT" in
+  mtime) mapfile -d '' -t files < <(find "$dir" -maxdepth 1 -type f -not -name '.*' "${GALLERY_FIND[@]}" -printf '%T@\t%p\0' 2>/dev/null | sort -z -t$'\t' -k1,1nr | cut -z -f2-) ;;
+  size) mapfile -d '' -t files < <(find "$dir" -maxdepth 1 -type f -not -name '.*' "${GALLERY_FIND[@]}" -printf '%s\t%p\0' 2>/dev/null | sort -z -t$'\t' -k1,1nr | cut -z -f2-) ;;
+  *) mapfile -d '' -t files < <(find "$dir" -maxdepth 1 -type f -not -name '.*' "${GALLERY_FIND[@]}" -print0 2>/dev/null | sort -zV) ;;
+  esac
+  G_FILES=("${dirs[@]}" "${files[@]}")
+  G_NDIRS=${#dirs[@]}
+  G_N=${#G_FILES[@]}
+  G_DIR="$dir"
+  G_SEL=0
+  G_TOP=0
+  G_THUMB=()
+  G_MARK=()
+  if [[ -n "$G_FOCUS" ]]; then
+    for ((i = 0; i < G_N; i++)); do
+      if [[ "${G_FILES[i]##*/}" == "$G_FOCUS" ]]; then
+        G_SEL=$i
+        break
+      fi
+    done
+    G_FOCUS=""
+  fi
+}
+
+_g_ensure_visible() {
+  local r=$((G_SEL / G_NCOLS)) old=$G_TOP
+  if ((r < G_TOP)); then
+    G_TOP=$r
+  elif ((r >= G_TOP + G_VIS)); then G_TOP=$((r - G_VIS + 1)); fi
+  ((G_TOP != old))
+}
+
+_g_cell_text() {
+  local i=$1 r c x y name mark label w pad st
+  r=$((i / G_NCOLS))
+  c=$((i % G_NCOLS))
+  ((r < G_TOP || r >= G_TOP + G_VIS)) && return
+  x=$((c * G_CW))
+  y=$((1 + (r - G_TOP) * G_CH))
+  name="${G_FILES[i]##*/}"
+  mark=" "
+  [[ -n "${G_MARK[$i]:-}" ]] && mark="+"
+  w=$((G_CW - 1))
+  if ((i < G_NDIRS)); then label=" $mark $name/"; else label=" $mark $name"; fi
+  label="${label:0:w}"
+  printf -v pad '%*s' "$w" ''
+  if ((i == G_SEL)); then st=$'\e[7m'; else st=$'\e[0m'; fi
+  printf '\e[%d;%dH%s%s\e[0m' $((y + 1)) $((x + 1)) "$st" "$pad"
+  printf '\e[%d;%dH%s%-*s\e[0m' $((y + G_CH)) $((x + 1)) "$st" "$w" "$label"
+  if ((i < G_NDIRS)); then # folders have no thumbnail: draw an icon + name
+    printf '\e[%d;%dH\e[0m%s %s' $((y + 2 + (G_CH - 2) / 2)) $((x + 3)) "$G_DIRICON" "${name:0:$((w - 6))}"
+  fi
+}
+
+_g_bar() {
+  printf '\e[%d;1H\e[44;97m%-*s\e[0m' "$1" "$G_COLS" " ${2:0:$((G_COLS - 2))}"
+}
+
+_g_status() {
+  local f="${G_FILES[G_SEL]}" sz hs n=${#G_MARK[@]} bot
+  _g_bar 1 "$(_tilde "$G_DIR")  -  $((G_N - G_NDIRS)) files, $G_NDIRS dirs  -  sort:$G_SORT  -  ? help  q quit"
+  if ((G_N == 0)); then
+    _g_bar "$G_ROWS" "Nothing viewable here  -  Backspace: parent directory"
+    return
+  fi
+  if ((G_SEL < G_NDIRS)); then
+    bot="${f##*/}/   (directory - Enter to open)   [$((G_SEL + 1))/$G_N]"
+  else
+    sz=$(stat -c %s -- "$f" 2>/dev/null)
+    hs=$(_human "${sz:-0}")
+    bot="${f##*/}   $hs   [$((G_SEL + 1))/$G_N]"
+  fi
+  ((n)) && bot+="   ($n marked)"
+  _g_bar "$G_ROWS" "$bot"
+}
+
+# One transparent sheet for all visible rows, laid out on the exact cell
+# grid (gaps between rows are where the text label rows show through).
+_g_sheet() {
+  local first=$1 last=$2 i key out tmp real=0
+  local -a args=()
+  for ((i = first; i <= last; i++)); do
+    if ((i < G_NDIRS)) || [[ -z "${G_THUMB[i]:-}" || "${G_THUMB[i]}" == BAD ]]; then
+      args+=(null:)
+    else
+      args+=("${G_THUMB[i]}")
+      real=1
+    fi
+  done
+  ((real)) || return 1
+  key=$(printf '%s\0' "${args[@]}" "$G_NCOLS" "$G_CW" "$G_CH" "$G_VIS" "$GC_W" "$GC_H" | md5sum | cut -d' ' -f1)
+  out="$GALLERY_DIR/g.$key.png"
+  if [[ -s "$out" ]]; then
+    touch -c -- "$out"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  local tw=$((G_CW * GC_W)) th=$(((G_CH - 2) * GC_H))
+  local W=$((G_NCOLS * G_CW * GC_W)) H=$((G_VIS * G_CH * GC_H))
+  tmp="$GALLERY_DIR/.g.$key.$$"
+  _montage -background none -geometry "$((tw - 6))x${th}+3+${GC_H}" \
+    -tile "${G_NCOLS}x" "${args[@]}" "miff:$tmp.miff" >/dev/null 2>&1
+  if [[ -s "$tmp.miff" ]]; then
+    _convert "miff:$tmp.miff" -background none -gravity northwest \
+      -extent "${W}x${H}" "png32:$tmp.png" >/dev/null 2>&1
+  fi
+  rm -f -- "$tmp.miff"
+  if [[ -s "$tmp.png" ]]; then
+    mv -f -- "$tmp.png" "$out"
+    printf '%s\n' "$out"
+  else
+    rm -f -- "$tmp.png"
+    return 1
+  fi
+}
+
+_g_draw_images() {
+  local first last i r c x y p sheet
+  local -a missing=()
+  first=$((G_TOP * G_NCOLS))
+  last=$(((G_TOP + G_VIS) * G_NCOLS - 1))
+  ((last >= G_N)) && last=$((G_N - 1))
+  for ((i = first; i <= last; i++)); do
+    ((i < G_NDIRS)) && continue
+    [[ "${G_THUMB[i]:-}" == BAD ]] && continue
+    if [[ -z "${G_THUMB[i]:-}" ]]; then
+      G_THUMB[i]=$(_thumb_path "${G_FILES[i]}" "$G_TS")
+    fi
+    [[ -s "${G_THUMB[i]}" ]] || missing+=("${G_FILES[i]}")
+  done
+  if ((${#missing[@]})); then
+    _g_bar "$G_ROWS" "Generating ${#missing[@]} thumbnails..."
+    local workers
+    workers=$(_workers)
+    printf '%s\0' "${missing[@]}" | FM_THUMB_SIZE=$G_TS xargs -0 -r -n1 -P"$workers" bash "$SELF" --thumb-any
+  fi
+  for ((i = first; i <= last; i++)); do
+    ((i < G_NDIRS)) && continue
+    [[ -s "${G_THUMB[i]:-}" ]] || G_THUMB[i]=BAD
+  done
+  if ((G_FAST)); then
+    if sheet=$(_g_sheet "$first" "$last"); then
+      "${ICAT[@]}" --transfer-mode=memory --stdin=no \
+        --place="$((G_NCOLS * G_CW))x$((G_VIS * G_CH))@0x1" "$sheet" </dev/null 2>/dev/null
+    fi
+    return
+  fi
+  for ((i = first; i <= last; i++)); do
+    ((i < G_NDIRS)) && continue
+    p="${G_THUMB[i]}"
+    [[ "$p" == BAD ]] && continue
+    r=$((i / G_NCOLS))
+    c=$((i % G_NCOLS))
+    x=$((c * G_CW + 1))
+    y=$((1 + (r - G_TOP) * G_CH + 1))
+    "${ICAT[@]}" --transfer-mode=memory --stdin=no \
+      --place="$((G_CW - 2))x$((G_CH - 2))@${x}x${y}" "$p" </dev/null 2>/dev/null
+  done
+}
+
+_g_redraw() {
+  local first last i
+  printf '\e_Ga=d,d=A\e\\\e[0m\e[2J'
+  first=$((G_TOP * G_NCOLS))
+  last=$(((G_TOP + G_VIS) * G_NCOLS - 1))
+  ((last >= G_N)) && last=$((G_N - 1))
+  for ((i = first; i <= last; i++)); do _g_cell_text "$i"; done
+  _g_status
+  _g_draw_images
+  _g_status
+}
+
+_g_select() {
+  local new=$1 old=$G_SEL
+  ((new < 0)) && new=0
+  ((new >= G_N)) && new=$((G_N - 1))
+  G_SEL=$new
+  if _g_ensure_visible; then
+    _g_redraw
+  else
+    _g_cell_text "$old"
+    _g_cell_text "$new"
+    _g_status
+  fi
+}
+
+_g_scroll() {
+  local maxtop nt r
+  maxtop=$(((G_N - 1) / G_NCOLS - G_VIS + 1))
+  ((maxtop < 0)) && maxtop=0
+  nt=$((G_TOP + $1))
+  ((nt < 0)) && nt=0
+  ((nt > maxtop)) && nt=$maxtop
+  ((nt == G_TOP)) && return
+  G_TOP=$nt
+  r=$((G_SEL / G_NCOLS))
+  if ((r < G_TOP)); then
+    G_SEL=$((G_TOP * G_NCOLS + G_SEL % G_NCOLS))
+  elif ((r >= G_TOP + G_VIS)); then G_SEL=$(((G_TOP + G_VIS - 1) * G_NCOLS + G_SEL % G_NCOLS)); fi
+  ((G_SEL >= G_N)) && G_SEL=$((G_N - 1))
+  _g_redraw
+}
+
+_g_hit() {
+  local col=$((MX - 1)) row=$((MY - 1)) c r idx
+  if ((row < 1 || row >= 1 + G_VIS * G_CH || col < 0)); then
+    echo -1
+    return
+  fi
+  c=$((col / G_CW))
+  r=$((G_TOP + (row - 1) / G_CH))
+  idx=$((r * G_NCOLS + c))
+  if ((c >= G_NCOLS || idx >= G_N)); then echo -1; else echo "$idx"; fi
+}
+
+# Reads one key / mouse event into KEY (MX/MY for mouse). CSI sequences are
+# consumed completely (modifiers, Delete, ...), so nothing leaks as stray keys.
+_g_readkey() {
+  local c seq b rc final
+  KEY=""
+  IFS= read -rsn1 c
+  rc=$?
+  if ((rc > 128)); then
+    KEY=none
+    return
+  elif ((rc)); then
+    KEY=quit
+    return
+  fi
+  case "$c" in
+  "") KEY=enter ;;
+  " ") KEY=space ;;
+  $'\x7f' | $'\b') KEY=backspace ;;
+  $'\e')
+    if ! IFS= read -rsn1 -t 0.05 c; then
+      KEY=esc
+      return
+    fi
+    if [[ "$c" != "[" && "$c" != "O" ]]; then
+      KEY=none
+      return
+    fi
+    seq=""
+    final=""
+    while IFS= read -rsn1 c; do
+      if [[ "$c" == [0-9\;\<:?] ]]; then seq+="$c"; else
+        final="$c"
+        break
+      fi
+    done
+    if [[ "$seq" == "<"* ]]; then
+      IFS=';' read -r b MX MY <<<"${seq#<}"
+      if [[ "$final" == "m" ]]; then
+        KEY=none
+      elif ((b & 64)); then
+        case $((b & 3)) in 0) KEY=wheelup ;; 1) KEY=wheeldown ;; *) KEY=none ;; esac
+      else
+        case $((b & 3)) in 0) KEY=click ;; 1) KEY=mclick ;; 2) KEY=rclick ;; *) KEY=none ;; esac
+      fi
+      return
+    fi
+    case "$final" in
+    A) KEY=up ;; B) KEY=down ;; C) KEY=right ;; D) KEY=left ;;
+    H) KEY=home ;; F) KEY=end ;;
+    '~')
+      case "${seq%%;*}" in
+      1 | 7) KEY=home ;; 4 | 8) KEY=end ;; 5) KEY=pgup ;; 6) KEY=pgdn ;; 3) KEY=delete ;; *) KEY=none ;;
+      esac
+      ;;
+    *) KEY=none ;;
+    esac
+    ;;
+  *) KEY="$c" ;;
+  esac
+}
+
+_g_targets() {
+  local i
+  if ((${#G_MARK[@]})); then
+    for i in $(printf '%s\n' "${!G_MARK[@]}" | sort -n); do printf '%s\0' "${G_FILES[i]}"; done
+  else
+    printf '%s\0' "${G_FILES[G_SEL]}"
+  fi
+}
+
+_g_full() {
+  local i=$1 thumb kind f redraw=1
+  while true; do
+    f="${G_FILES[i]}"
+    if ((redraw)); then
+      redraw=0
+      kind=$(_file_kind "$f")
+      [[ -z "$kind" ]] && kind=image
+      thumb=$(_make_thumb "$f" "$kind") || thumb=""
+      printf '\e_Ga=d,d=A\e\\\e[0m\e[2J'
+      _g_bar 1 "${f##*/}   [$((i - G_NDIRS + 1))/$((G_N - G_NDIRS))]   ($kind)"
+      _g_bar "$G_ROWS" "Left/Right: prev/next  ·  o: open  ·  Backspace: parent  ·  q / Esc / click: back"
+      if [[ -n "$thumb" ]]; then
+        "${ICAT[@]}" --transfer-mode=memory --stdin=no \
+          --place="${G_COLS}x$((G_ROWS - 2))@0x1" "$thumb" </dev/null 2>/dev/null
+      elif [[ "$kind" == "md" ]] && _have glow; then
+        printf '\e[2;1H'
+        glow -s dark "$f" 2>/dev/null | head -n "$((G_ROWS - 2))"
+      else
+        printf '\e[3;3H(no preview available)'
+      fi
+    fi
+    _g_readkey
+    if ((G_RESIZE)); then
+      G_RESIZE=0
+      _g_layout
+      redraw=1
+    fi
+    case "$KEY" in
+    left | h | up | k | pgup | wheelup) if ((i > G_NDIRS)); then
+      i=$((i - 1))
+      redraw=1
+    fi ;;
+    right | l | down | j | pgdn | space | wheeldown) if ((i < G_N - 1)); then
+      i=$((i + 1))
+      redraw=1
+    fi ;;
+    home | g)
+      i=$G_NDIRS
+      redraw=1
+      ;;
+    end | G)
+      i=$((G_N - 1))
+      redraw=1
+      ;;
+    o | mclick) _launch "$f" ;;
+    q | esc | enter | click | rclick | quit) break ;;
+    esac
+  done
+  G_SEL=$i
+}
+
+_help_grid() {
+  cat <<'HELP'
+ GALLERY GRID (Alt-G, or: fm --grid [dir])
+   Arrows / h j k l      Move selection
+   PgUp / PgDn           Move one screen   (g / G: first / last)
+   Mouse wheel           Scroll rows
+   Left click            Select item       (double click: open)
+   Middle click          Open externally   (folder: go inside)
+   Right click           Parent directory
+   Enter                 Folder: go inside / File: view full screen
+                         (Left/Right to browse files)
+   Backspace / -         Parent directory (re-selects the folder you left)
+   Space                 Mark / unmark
+   a / A                 Mark-all visible / Unmark-all
+   o                     Open marked (or selected) externally
+   y                     Copy absolute path(s)
+   x / Delete            Move marked (or selected) to trash (asks)
+   s                     Cycle sort: name / mtime / size
+   + / =    _            Bigger / smaller thumbnails
+   r                     Reload
+   f                     Leave gallery and focus in file list
+   ?                     Help
+   q / Esc               Close gallery
+
+ Types: images, videos, PDFs (first page), Markdown (rendered), folders
+HELP
+}
+
+_help_main() {
+  cat <<'EOF'
+ fm - KEY MAP
+ ------------------------------------------------------------
+ FILE LIST
+   Enter      Open dir / file (on ".." go up); opens all selected files
+   Tab        Multi-select
+   Esc        Quit
+   F1 / Alt-h This help
+
+ ACTIONS
+   Ctrl-d     Move selection to trash
+   Alt-d      Same as Ctrl-d
+   Ctrl-z     Undo last trash batch (pop the undo stack)
+   Alt-t      Browse the trash (restore / delete / copy / search / empty)
+   Ctrl-y     Copy absolute path(s) to clipboard
+   Ctrl-o     Force open externally (xdg-open)
+   Ctrl-n     New file (end name with / for a directory)
+   Ctrl-e     Rename selected item
+   Alt-m / Ctrl-w  Bulk rename via $EDITOR (swaps/chains are handled)
+   Ctrl-k     Move selection to a destination
+   Ctrl-p     Copy selection to a destination
+   Ctrl-l     Create symlink(s) to selection
+   Alt-i      Show file info   (Ctrl-i is Tab in a terminal)
+
+ SEARCH
+   Ctrl-f     Search inside selected file(s) (falls back to cwd)
+   Alt-z      Zoxide jump
+   Ctrl-b     Bookmarks (Enter: jump/add, Ctrl-x: delete)
+   fm <query> Shell-side: jump to best zoxide match
+
+ VIEW
+   Ctrl-s     Cycle sort: name -> size -> mtime -> ext
+   Ctrl-r     Toggle recursive listing (depth 1 <-> 5)
+   Ctrl-h / Alt-.  Toggle hidden files
+   Ctrl-g     Git mode
+   Ctrl-t     Toggle contact-sheet preview (hovered dir, or the current
+              dir when a file is hovered; fills the preview pane)
+   Alt-j / Alt-k  Next / previous page of the contact sheet
+              (works on files too; the sheet follows the hovered file)
+   Alt-n / Alt-p  Same as above (alternate keys)
+   Alt-g      Open full-screen gallery grid
+
+ MOUSE
+   Double-click   Open file / enter directory
+   Right-click    Go up to the parent directory
+   Wheel          Scroll the list (or the preview when hovering it)
+   Ctrl+Shift+click  a name in a directory preview: open it (kitty only;
+                  run  fm --setup-kitty  once, then restart kitty)
+   In popups (trash, zoxide, bookmarks, search, ...): double-click selects,
+   right-click cancels
+
+ PREVIEW PANE
+   Ctrl-v     Scroll text preview one page down
+   Ctrl-u     Scroll text preview one page up
+   F3 / F2    Same as above (backup keys)
+
+   Note: contact sheets are a single image; use Alt-j / Alt-k to page.
+
+ TRASH BROWSER (Alt-t)
+   Enter      Restore selected item(s)
+   Ctrl-d     Permanently delete (asks to confirm)
+   Ctrl-y     Copy original path(s) to clipboard
+   Ctrl-f     Search inside all trashed files
+   Ctrl-x     Empty the entire trash (asks to confirm)
+
+ NOTE: Backspace can't go up in the file list (fzf uses it for query).
+       Use the ".." entry, or Backspace in the gallery grid.
+EOF
+}
+
+_usage() {
+  cat <<'EOF'
+Usage: fm [start_directory | file | zoxide-query...]
+       fm --grid [dir]     full-screen gallery; 'f' prints the picked file
+       fm --setup-kitty    enable Ctrl+Shift+click on preview paths (kitty)
+       fm -h | --help
+
+Press F1 (or Alt-h) inside fm for the full key map.
+EOF
+}
+
+_grid_view() {
+  local dir="$1"
+  local mark_i idx now last_idx=-1 last_t=0 f n
+  GRID_PICK=""
+  _in_kitty || {
+    _pause "Gallery grid needs Kitty (kitten icat)."
+    return 1
+  }
+
+  _probe_cell
+  trap 'G_RESIZE=1' WINCH
+  _grid_enter
+
+  local leave=0
+  while true; do
+    dir=$(readlink -f -- "$dir") || break
+    _g_load "$dir"
+    G_RESIZE=0
+    _g_layout
+    _g_ensure_visible
+    _g_redraw
+
+    while true; do
+      _g_readkey
+      if ((G_RESIZE)); then
+        G_RESIZE=0
+        unset FM_CELL_W FM_CELL_H
+        _probe_cell
+        G_THUMB=()
+        _g_relayout
+      fi
+      case "$KEY" in
+      q | esc | quit)
+        leave=1
+        break
+        ;;
+      backspace | - | rclick)
+        local parent
+        parent=$(dirname -- "$dir")
+        if [[ "$parent" != "$dir" ]]; then
+          G_FOCUS="${dir##*/}"
+          dir="$parent"
+          break
+        fi
+        _g_bar "$G_ROWS" "Already at filesystem root."
+        ;;
+      left | h) ((G_N)) && _g_select $((G_SEL - 1)) ;;
+      right | l) ((G_N)) && _g_select $((G_SEL + 1)) ;;
+      up | k) ((G_N)) && _g_select $((G_SEL - G_NCOLS)) ;;
+      down | j) ((G_N)) && _g_select $((G_SEL + G_NCOLS)) ;;
+      pgup) ((G_N)) && _g_select $((G_SEL - G_NCOLS * G_VIS)) ;;
+      pgdn) ((G_N)) && _g_select $((G_SEL + G_NCOLS * G_VIS)) ;;
+      home | g) ((G_N)) && _g_select 0 ;;
+      end | G) ((G_N)) && _g_select $((G_N - 1)) ;;
+      wheelup) ((G_N)) && _g_scroll -1 ;;
+      wheeldown) ((G_N)) && _g_scroll 1 ;;
+      enter)
+        if ((G_N)); then
+          if ((G_SEL < G_NDIRS)); then
+            dir="${G_FILES[G_SEL]}"
+            break
+          fi
+          _g_full "$G_SEL"
+          _g_ensure_visible
+          _g_redraw
+        fi
+        ;;
+      space)
+        if ((G_N)); then
+          if [[ -n "${G_MARK[$G_SEL]:-}" ]]; then unset 'G_MARK[$G_SEL]'; else G_MARK[$G_SEL]=1; fi
+          mark_i=$G_SEL
+          _g_cell_text "$mark_i"
+          _g_select $((G_SEL + 1))
+          _g_status
+        fi
+        ;;
+      'a')
+        if ((G_N)); then
+          local vfirst=$((G_TOP * G_NCOLS))
+          local vlast=$((vfirst + G_VIS * G_NCOLS - 1))
+          ((vlast >= G_N)) && vlast=$((G_N - 1))
+          for ((idx = vfirst; idx <= vlast; idx++)); do
+            G_MARK[$idx]=1
+            _g_cell_text "$idx"
+          done
+          _g_status
+        fi
+        ;;
+      'A')
+        G_MARK=()
+        _g_redraw
+        ;;
+      click)
+        idx=$(_g_hit)
+        if ((idx >= 0)); then
+          # EPOCHREALTIME -> integer microseconds (the decimal separator
+          # follows the locale, so strip either "." or ",").
+          now=${EPOCHREALTIME/[.,]/}
+          if ((idx == last_idx && now - last_t < 400000)); then
+            G_SEL=$idx
+            last_idx=-1
+            if ((idx < G_NDIRS)); then
+              dir="${G_FILES[idx]}"
+              break
+            fi
+            _g_full "$idx"
+            _g_ensure_visible
+            _g_redraw
+          else
+            _g_select "$idx"
+            last_idx=$idx
+            last_t=$now
+          fi
+        fi
+        ;;
+      mclick)
+        idx=$(_g_hit)
+        if ((idx >= 0)); then
+          _g_select "$idx"
+          if ((idx < G_NDIRS)); then
+            dir="${G_FILES[idx]}"
+            break
+          fi
+          _launch "${G_FILES[idx]}"
+          _g_bar "$G_ROWS" "Opened externally"
+        fi
+        ;;
+      o)
+        ((G_N)) && {
+          while IFS= read -r -d '' f; do _launch "$f"; done < <(_g_targets)
+          _g_bar "$G_ROWS" "Opened externally"
+        }
+        ;;
+      y)
+        ((G_N)) && {
+          if _g_targets | xargs -0 -r printf '%s\n' | _clipboard; then
+            _g_bar "$G_ROWS" "Copied path(s) to clipboard"
+          else
+            _g_bar "$G_ROWS" "No clipboard tool (wl-copy / xclip)"
+          fi
+        }
+        ;;
+      x | delete)
+        if ((G_N)); then
+          local -a tl=()
+          while IFS= read -r -d '' f; do tl+=("$f"); done < <(_g_targets)
+          _g_bar "$G_ROWS" "Move ${#tl[@]} item(s) to trash? [y/N]"
+          _g_readkey
+          if [[ "$KEY" == y || "$KEY" == Y ]]; then
+            printf '\e[%d;1H\e[0m' "$G_ROWS"
+            _trash_and_record "${tl[@]}"
+            if ((G_SEL + 1 < G_N)); then
+              G_FOCUS="${G_FILES[G_SEL + 1]##*/}"
+            elif ((G_SEL > 0)); then
+              G_FOCUS="${G_FILES[G_SEL - 1]##*/}"
+            fi
+            break
+          fi
+          _g_status
+        fi
+        ;;
+      s)
+        case "$G_SORT" in
+        name) G_SORT=mtime ;;
+        mtime) G_SORT=size ;;
+        *) G_SORT=name ;;
+        esac
+        ((G_N)) && G_FOCUS="${G_FILES[G_SEL]##*/}"
+        break
+        ;;
+      r)
+        ((G_N)) && G_FOCUS="${G_FILES[G_SEL]##*/}"
+        break
+        ;;
+      '+' | '=')
+        n=$G_NCOLS
+        ((n > 1)) && G_NC_FORCE=$((n - 1))
+        G_THUMB=()
+        _g_relayout
+        ;;
+      '_')
+        n=$G_NCOLS
+        ((n < 12)) && G_NC_FORCE=$((n + 1))
+        G_THUMB=()
+        _g_relayout
+        ;;
+      f)
+        ((G_N)) && GRID_PICK="${G_FILES[G_SEL]}"
+        leave=1
+        break
+        ;;
+      '?')
+        printf '\e_Ga=d,d=A\e\\\e[0m\e[2J\e[H'
+        _help_grid
+        printf '\n Press any key...'
+        _g_readkey
+        _g_redraw
+        ;;
+      esac
+    done
+
+    ((leave)) && break
+  done
+
+  _grid_leave
+  trap - WINCH
+  return 0
+}
+
+# ==========================================================================
+#  Subcommand dispatch
+# ==========================================================================
+case "${1:-}" in
+-h | --help)
+  _usage
+  exit 0
+  ;;
+--preview)
+  shift
+  _preview "$@"
+  exit 0
+  ;;
+--preview-line)
+  shift
+  _preview_line "$@"
+  exit 0
+  ;;
+--thumb-any)
+  shift
+  k=$(_file_kind "$1")
+  [[ -z "$k" ]] && k=image
+  _make_thumb "$1" "$k" "${FM_THUMB_SIZE:-$GRID_SIZE}" >/dev/null
+  exit 0
+  ;;
+--toggle-gallery)
+  g=$(_gflag)
+  if [[ -e "$g" ]]; then rm -f -- "$g"; else : >"$g"; fi
+  exit 0
+  ;;
+--gallery-page)
+  # $2 = delta, $3 = hovered entry (a directory, or a file -> its directory)
+  if [[ -d "$3" ]]; then d=$(readlink -f -- "$3" 2>/dev/null); else d=$(readlink -f -- "$(dirname -- "$3")" 2>/dev/null); fi
+  [[ -d "$d" ]] || exit 0
+  pf="$(_gflag).page"
+  cur=0 pl=""
+  if [[ -f "$pf" ]]; then
+    IFS=$'\t' read -r pd pn pl <"$pf"
+    if [[ "$pd" == "$d" && "$pn" =~ ^[0-9]+$ ]]; then cur=$pn; else pl=""; fi
+  fi
+  cur=$((cur + $2))
+  ((cur < 0)) && cur=0
+  printf '%s\t%s\t%s\n' "$d" "$cur" "$pl" >"$pf"
+  exit 0
+  ;;
+--save-port)
+  # run by fzf's `start` event: remember how to reach this fm's fzf
+  (
+    umask 077
+    printf '%s\t%s\t%s\n' "${FM_MAIN_PID:-0}" "${FZF_PORT:-}" "${FZF_API_KEY:-}" >"$STATE_DIR/active"
+  )
+  exit 0
+  ;;
+--link-open)
+  # Called by kitty (open-actions) when a path hyperlink in the preview is
+  # Ctrl+Shift+clicked: ask the running fm to go there. No fm -> xdg-open.
+  p="${2:-}"
+  [[ -e "$p" || -L "$p" ]] || exit 0
+  ok=0
+  if [[ -r "$STATE_DIR/active" ]]; then
+    IFS=$'\t' read -r apid aport akey <"$STATE_DIR/active"
+    if [[ -n "$apid" && -n "$aport" ]] && kill -0 "$apid" 2>/dev/null; then
+      printf '%s\n' "$p" >"$STATE_DIR/nav.$apid"
+      if (
+        exec 3<>"/dev/tcp/127.0.0.1/$aport" &&
+          printf 'POST / HTTP/1.0\r\nx-api-key: %s\r\nContent-Length: 5\r\n\r\nabort' "$akey" >&3 &&
+          read -r -t 2 _ <&3
+      ) 2>/dev/null; then
+        ok=1
+      else
+        rm -f -- "$STATE_DIR/nav.$apid"
+      fi
+    fi
+  fi
+  if ((!ok)); then
+    _have xdg-open && setsid -f xdg-open "$p" >/dev/null 2>&1
+  fi
+  exit 0
+  ;;
+--setup-kitty)
+  f="${XDG_CONFIG_HOME:-$HOME/.config}/kitty/open-actions.conf"
+  if grep -qF -e '--link-open' "$f" 2>/dev/null; then
+    echo "fm: already set up in $f"
+  else
+    mkdir -p -- "$(dirname -- "$f")"
+    {
+      printf '\n# fm: Ctrl+Shift+click a path in the directory preview to open it in fm\n'
+      printf 'protocol file\n'
+      # SELF is shell-split by kitty, so quote it; ${FILE_PATH} is expanded by
+      # kitty per argument after splitting, so it must stay unquoted.
+      printf "action launch --type=background '%s' --link-open \${FILE_PATH}\n" "${SELF//\'/\'\\\'\'}"
+    } >>"$f"
+    echo "fm: added the rule to $f"
+    echo "    Restart kitty, then Ctrl+Shift+click any name in a directory preview."
+    echo "    (Needs to come before any other 'protocol file' catch-all rule.)"
+  fi
+  exit 0
+  ;;
+--mouse-up)
+  : >"$(_gflag).up"
+  exit 0
+  ;;
+--undo-trash)
+  _undo_pop_apply
+  exit 0
+  ;;
+--preview-trash)
+  shift
+  _preview_trash "$1"
+  exit 0
+  ;;
+--help-keys)
+  _clear_img
+  {
+    _help_main
+    _help_grid
+  } | if _have less; then less -R; else
+    cat
+    read -rsn1 -p ' Press any key...'
+  fi
+  exit 0
+  ;;
+--grid)
+  # UI goes to the tty, the pick goes to the real stdout, so
+  # `file=$(fm --grid)` works.
+  exec 4>&1 >/dev/tty
+  trap _grid_leave EXIT
+  trap 'exit 130' INT TERM
+  if _grid_view "${2:-$PWD}" && [[ -n "$GRID_PICK" ]]; then
+    printf '%s\n' "$GRID_PICK" >&4
+  fi
+  exit 0
+  ;;
+esac
+
+# ==========================================================================
+#  Startup
+# ==========================================================================
+export FM_MAIN_PID=$$
+QSELF=$(printf '%q' "$SELF")
+RUN="bash $QSELF"
+
+_have fzf || {
+  echo "fm: fzf is required"
+  exit 1
+}
+_have eza || {
+  echo "fm: eza is required"
+  exit 1
+}
+
+start_dir="$PWD"
+if [[ -n "${1:-}" ]]; then
+  if [[ -d "$1" ]]; then
+    start_dir="$1"
+  elif [[ -e "$1" ]]; then
+    # a file: open its directory with the file focused
+    start_dir=$(dirname -- "$1")
+    FOCUS_NAME=$(basename -- "$1")
+  elif _have zoxide; then
+    start_dir=$(zoxide query -- "$@") || {
+      echo "fm: no zoxide match for: $*"
+      exit 1
+    }
+  else
+    echo "fm: not a directory: $1" >&2
+    exit 1
+  fi
+fi
+cd -- "$start_dir" || exit 1
+_probe_cell
+
+PREWARM_PID=""
+PREWARM_KEY=""
+
+_stop_prewarm() {
+  [[ -n "$PREWARM_PID" ]] || return 0
+  # children first, then xargs itself (the other order orphans the workers)
+  pkill -P "$PREWARM_PID" 2>/dev/null
+  kill "$PREWARM_PID" 2>/dev/null
+  PREWARM_PID=""
+  PREWARM_KEY=""
+}
+
+_on_exit() {
+  _grid_leave
+  _cleanup_kitty
+  printf '\e[?1000l\e[?1006l\e[?25h' 2>/dev/null >/dev/tty
+  rm -f -- "$(_gflag)" "$(_gflag).page" "$(_gflag).up"
+  rm -f -- "$STATE_DIR/nav.$$"
+  if [[ -r "$STATE_DIR/active" ]]; then
+    IFS=$'\t' read -r apid _ <"$STATE_DIR/active"
+    [[ "$apid" == "$$" ]] && rm -f -- "$STATE_DIR/active"
+  fi
+  _stop_prewarm
+}
+trap _on_exit EXIT
+trap 'exit 130' INT TERM
+
+(find "$THUMB_DIR" "$GALLERY_DIR" -type f -mtime +"$CACHE_DAYS" -delete 2>/dev/null &)
+
+# ==========================================================================
+#  Main-UI helpers
+# ==========================================================================
+_cd() {
+  cd -- "$1" || return 1
+  _have zoxide && zoxide add -- "$PWD"
+  return 0
+}
+
+_fm_header() {
+  local depth
+  depth=$(_undo_depth)
+  printf 'Enter:Open Tab:Multi F1:Help C-f:Find C-z:Undo(%s) A-t:Trash C-s:Sort(%s) A-m:Bulk C-t:Gallery A-g:Grid C-v/C-u:Scroll C-r:Rec(%s) C-h:Hid(%s) Esc:Quit' \
+    "$depth" "$SORT_MODE" "$MAX_DEPTH" "$SHOW_HIDDEN"
+}
+
+PREVIEW_BINDS=(
+  --bind 'ctrl-v:preview-page-down,ctrl-u:preview-page-up'
+  --bind 'f2:preview-page-up,f3:preview-page-down'
+  --bind 'alt-f:preview-page-down,alt-b:preview-page-up'
+)
+
+# Mouse: double-click selects/opens, right-click goes up (main list) or
+# cancels (pickers). right-click only exists in newer fzf, so probe for it.
+HAS_RCLICK=0
+echo | fzf --filter x --bind 'right-click:abort' >/dev/null 2>&1
+(($? != 2)) && HAS_RCLICK=1
+PICKER_MOUSE=(--bind 'double-click:accept')
+((HAS_RCLICK)) && PICKER_MOUSE+=(--bind 'right-click:abort')
+MOUSE_BINDS=(--bind 'double-click:accept')
+((HAS_RCLICK)) && MOUSE_BINDS+=(--bind "right-click:execute-silent($RUN --mouse-up)+abort")
+# every popup picker (trash, zoxide, bookmarks, destination, git) uses these
+PREVIEW_BINDS+=("${PICKER_MOUSE[@]}")
+
+# Clickable paths in directory previews: eza emits OSC 8 hyperlinks, kitty
+# turns Ctrl+Shift+click into `fm --link-open PATH` (see --setup-kitty), which
+# reaches this fzf through its --listen API (protected by a random key).
+LISTEN_OPTS=()
+if _in_kitty && [[ "$(eza --help 2>&1)" == *--hyperlink* ]]; then
+  echo | fzf --filter x --listen=0 >/dev/null 2>&1
+  if (($? != 2)); then
+    FZF_API_KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    export FZF_API_KEY FM_HYPERLINK=1
+    LISTEN_OPTS=(--listen=0 --bind "start:execute-silent($RUN --save-port)")
+  fi
+fi
+
+_gb() {
+  GB=(--bind "alt-j:execute-silent($RUN --gallery-page 1 $1)+refresh-preview"
+    --bind "alt-k:execute-silent($RUN --gallery-page -1 $1)+refresh-preview"
+    --bind "alt-n:execute-silent($RUN --gallery-page 1 $1)+refresh-preview"
+    --bind "alt-p:execute-silent($RUN --gallery-page -1 $1)+refresh-preview")
+}
+
+_edit() { _open_at "$1"; }
+
+_prewarm() {
+  # same directory + hidden setting and still running: leave it alone
+  local key="$PWD|$SHOW_HIDDEN"
+  if [[ -n "$PREWARM_PID" && "$PREWARM_KEY" == "$key" ]] && kill -0 "$PREWARM_PID" 2>/dev/null; then
+    return 0
+  fi
+  _stop_prewarm
+  PREWARM_KEY="$key"
+  local hid=()
+  [[ "$SHOW_HIDDEN" == "0" ]] && hid=(-not -name '.*')
+  local workers
+  workers=$(_workers)
+  xargs -0 -r -n1 -P"$workers" bash "$SELF" --thumb-any \
+    < <(find . -maxdepth 1 -type f "${hid[@]}" "${GALLERY_FIND[@]}" -print0 2>/dev/null | head -z -n 400) \
+    >/dev/null 2>&1 &
+  PREWARM_PID=$!
+}
+
+# Output: "rawname<TAB>eza-rendered name". One batched stat, one awk pass.
+_fm_list() {
+  local -a names=()
+  local fd_flags=() find_flags=()
+  [[ "$SHOW_HIDDEN" == "1" ]] && fd_flags+=(--hidden)
+  # Flat listing shows everything (like the find fallback); the recursive
+  # view keeps .gitignore so node_modules & co. don't flood it.
+  [[ "$MAX_DEPTH" == "1" ]] && fd_flags+=(--no-ignore)
+  [[ "$SHOW_HIDDEN" == "0" ]] && find_flags=(-not -path '*/.*')
+
+  if _have fd; then
+    mapfile -t names < <(fd "${fd_flags[@]}" --follow --exclude .git \
+      --max-depth "$MAX_DEPTH" . 2>/dev/null |
+      sed -e 's|^\./||' -e 's|/$||')
+  else
+    mapfile -t names < <(find . -mindepth 1 -maxdepth "$MAX_DEPTH" \
+      -not -name .git -not -path '*/.git/*' "${find_flags[@]}" -printf '%P\n' 2>/dev/null)
+  fi
+
+  local sorted="" nl=$'\n'
+  if ((${#names[@]})); then
+    # stat -L first so symlinks-to-dirs sort as dirs; plain stat second to
+    # pick up broken symlinks (awk keeps the first record per name).
+    local meta keys
+    meta=$({
+      printf '%s\0' "${names[@]}" | xargs -0 -r stat -L -c $'%n\t%F\t%s\t%Y' -- 2>/dev/null
+      printf '%s\0' "${names[@]}" | xargs -0 -r stat -c $'%n\t%F\t%s\t%Y' -- 2>/dev/null
+    })
+    # No %020d padding: mawk clamps %d at 2^31, which mangled big sizes.
+    keys=$(awk -F'\t' -v mode="$SORT_MODE" '
+      seen[$1]++ { next }
+      {
+        d = ($2 == "directory") ? 1 : 2
+        name = $1; lower = tolower(name)
+        if (mode == "name") {
+          printf "%d\t%s\t\t%s\n", d, lower, name
+        } else if (mode == "size") {
+          printf "%d\t%s\t%s\t%s\n", d, $3, lower, name
+        } else if (mode == "mtime") {
+          printf "%d\t%s\t%s\t%s\n", d, $4, lower, name
+        } else {
+          ext = name; sub(/^.*\./, "", ext); if (ext == name) ext = ""
+          printf "%d\t%s\t%s\t%s\n", d, tolower(ext), lower, name
+        }
+      }' <<<"$meta")
+
+    case "$SORT_MODE" in
+    name) sorted=$(sort -t$'\t' -k1,1n -k2,2V <<<"$keys" | cut -f4-) ;;
+    size) sorted=$(sort -t$'\t' -k1,1n -k2,2nr -k3,3V <<<"$keys" | cut -f4-) ;;
+    mtime) sorted=$(sort -t$'\t' -k1,1n -k2,2nr -k3,3V <<<"$keys" | cut -f4-) ;;
+    ext) sorted=$(sort -t$'\t' -k1,1n -k2,2V -k3,3V <<<"$keys" | cut -f4-) ;;
+    esac
+  fi
+
+  # ".." must exist even in an empty directory, otherwise entering one
+  # would dump you out of fm.
+  [[ "$PWD" != "/" ]] && sorted="..${sorted:+$nl$sorted}"
+  [[ -z "$sorted" ]] && return 0
+
+  local rendered
+  rendered=$(printf '%s\n' "$sorted" | xargs -d '\n' eza -1 -d --sort=none \
+    --icons=always --color=always --no-quotes -- 2>/dev/null)
+
+  if [[ $(wc -l <<<"$sorted") -eq $(wc -l <<<"$rendered") ]]; then
+    paste -d '\t' <(printf '%s\n' "$sorted") <(printf '%s\n' "$rendered")
+  else
+    while IFS= read -r name; do printf '%s\t%s\n' "$name" "$name"; done <<<"$sorted"
+  fi
+}
+
+_open_file() {
+  local f="$1" mime kind
+  kind=$(_file_kind "$f")
+  case "$kind" in
+  image | video)
+    _launch "$f"
+    return
+    ;;
+  esac
+  mime=$(file --mime-type -b -- "$f" 2>/dev/null)
+  case "$mime" in
+  audio/* | application/pdf | application/epub+zip | \
+    application/vnd.openxmlformats-officedocument.* | \
+    application/vnd.oasis.opendocument.* | \
+    application/msword | application/vnd.ms-* | \
+    application/x-iso9660-appimage | application/x-executable | \
+    application/x-pie-executable | application/x-sharedlib | application/zip | \
+    application/x-tar | application/x-7z-compressed | application/x-rar | \
+    application/gzip | application/x-bzip2 | application/x-xz | \
+    application/x-zstd)
+    _launch "$f"
+    ;;
+  *)
+    _edit "$f"
+    ;;
+  esac
+}
+
+_pick_dest() {
+  local dest
+  _gb '{}'
+  dest=$(
+    {
+      echo "$PWD"
+      _have zoxide && zoxide query --list 2>/dev/null
+      echo "$HOME"
+      echo "/tmp"
+      if _have fd; then
+        fd --type d --hidden --exclude .git --exclude node_modules --exclude .cache \
+          --max-depth 4 . "$HOME" 2>/dev/null | sed 's|/$||'
+      else
+        find "$HOME" -maxdepth 4 -type d \
+          -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/.cache/*' 2>/dev/null
+      fi
+    } | awk '!seen[$0]++' |
+      FZF_DEFAULT_OPTS='' fzf \
+        --height 60% --layout reverse --border \
+        --prompt 'Destination > ' \
+        --preview "$RUN --preview {}" --preview-window 'right:60%:wrap' \
+        "${PREVIEW_BINDS[@]}" \
+        "${GB[@]}" \
+        --header 'Enter: choose destination  C-v/C-u: scroll preview  Esc: cancel'
+  )
+  _cleanup_kitty
+  [[ -n "$dest" ]] && printf '%s\n' "$dest"
+}
+
+_bm_remove() {
+  [[ -f "$BOOKMARKS_FILE" ]] || return 0
+  awk -F'|' -v n="$1" '$1 != n' "$BOOKMARKS_FILE" >"$BOOKMARKS_FILE.tmp" &&
+    mv -- "$BOOKMARKS_FILE.tmp" "$BOOKMARKS_FILE"
+}
+
+_have zoxide && zoxide add -- "$PWD"
+
+# ==========================================================================
+#  Main loop
+# ==========================================================================
+while true; do
+  entries=$(_fm_list)
+
+  if [[ -z "$entries" ]]; then
+    echo "(empty directory)"
+    exit 0
+  fi
+
+  _prewarm
+
+  fzf_extra=()
+  if [[ -n "$FOCUS_NAME" ]]; then
+    fidx=$(FN="$FOCUS_NAME" awk -F'\t' '$1==ENVIRON["FN"]{print NR; exit}' <<<"$entries")
+    [[ -n "$fidx" ]] && fzf_extra=(--bind "start:pos($fidx)")
+    FOCUS_NAME=""
+  fi
+
+  _gb '{1}'
+  selection=$(
+    printf '%s\n' "$entries" | FZF_DEFAULT_OPTS='' fzf \
+      --height 70% \
+      --layout reverse \
+      --border \
+      --info inline \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth=2 \
+      --prompt "$(_tilde "$PWD") > " \
+      --preview "$RUN --preview {1}" \
+      --preview-window 'right:60%:wrap' \
+      "${PREVIEW_BINDS[@]}" \
+      "${GB[@]}" \
+      "${MOUSE_BINDS[@]}" \
+      "${LISTEN_OPTS[@]}" \
+      --bind "ctrl-t:execute-silent($RUN --toggle-gallery)+refresh-preview" \
+      --bind "f1:execute($RUN --help-keys)" \
+      --bind "alt-h:execute($RUN --help-keys)" \
+      "${fzf_extra[@]}" \
+      --expect='ctrl-d,alt-d,ctrl-z,alt-t,ctrl-y,ctrl-o,ctrl-n,ctrl-e,ctrl-k,ctrl-p,ctrl-b,ctrl-r,ctrl-h,alt-.,ctrl-g,alt-z,alt-g,ctrl-f,alt-i,ctrl-l,ctrl-s,alt-m,ctrl-w' \
+      --multi \
+      --header "$(_fm_header)"
+  )
+  _cleanup_kitty
+
+  navf="$STATE_DIR/nav.$$"
+  if [[ -s "$navf" ]]; then # Ctrl+Shift+click on a path in the preview
+    IFS= read -r navp <"$navf"
+    rm -f -- "$navf"
+    if [[ -d "$navp" ]]; then
+      _cd "$navp" || break
+    elif [[ -e "$navp" || -L "$navp" ]]; then
+      _cd "$(dirname -- "$navp")" || break
+      FOCUS_NAME=$(basename -- "$navp")
+      _open_file "$navp"
+    fi
+    continue
+  fi
+
+  upflag="$(_gflag).up"
+  if [[ -e "$upflag" ]]; then # right-click: go to the parent directory
+    rm -f -- "$upflag"
+    if [[ "$PWD" != "/" ]]; then
+      FOCUS_NAME="${PWD##*/}"
+      _cd .. || break
+    fi
+    continue
+  fi
+
+  [[ -z "$selection" ]] && break
+
+  key=$(head -1 <<<"$selection")
+
+  all=()
+  sel=()
+  raw=$(tail -n +2 <<<"$selection" | cut -f1)
+  [[ -n "$raw" ]] && mapfile -t all <<<"$raw"
+  for f in "${all[@]}"; do [[ "$f" != ".." ]] && sel+=("$f"); done
+
+  case "$key" in
+  alt-g)
+    gdir="$PWD"
+    ((${#sel[@]})) && [[ -d "${sel[0]}" ]] && gdir="$PWD/${sel[0]}"
+    _grid_view "$gdir"
+    if [[ -n "$GRID_PICK" ]]; then
+      _cd "$(dirname -- "$GRID_PICK")" && FOCUS_NAME=$(basename -- "$GRID_PICK")
+    fi
+    continue
+    ;;
+  alt-z)
+    _have zoxide || {
+      _pause "zoxide is not installed"
+      continue
+    }
+    _gb '{}'
+    zt=$(zoxide query --list 2>/dev/null | FZF_DEFAULT_OPTS='' fzf \
+      --height 60% --layout reverse --border --no-sort \
+      --prompt 'zoxide > ' \
+      --preview "$RUN --preview {}" --preview-window 'right:60%:wrap' \
+      "${PREVIEW_BINDS[@]}" \
+      "${GB[@]}" \
+      --header 'Enter: jump  A-j/A-k: gallery page  Esc: cancel')
+    _cleanup_kitty
+    [[ -d "$zt" ]] && _cd "$zt"
+    continue
+    ;;
+  ctrl-d | alt-d)
+    ((${#sel[@]})) || continue
+    _trash_and_record "${sel[@]}"
+    continue
+    ;;
+  ctrl-z)
+    _undo_pop_apply
+    continue
+    ;;
+  alt-t)
+    _trash_browser
+    continue
+    ;;
+  ctrl-y)
+    ((${#sel[@]})) || continue
+    for f in "${sel[@]}"; do printf '%s\n' "$PWD/$f"; done | _clipboard ||
+      _pause "No clipboard tool found (wl-copy / xclip)"
+    continue
+    ;;
+  ctrl-o)
+    for f in "${sel[@]}"; do _launch "$f"; done
+    continue
+    ;;
+  ctrl-n)
+    read -r -p "Name (end with / for dir): " name
+    [[ -z "$name" ]] && continue
+    if [[ "$name" == */ ]]; then
+      mkdir -p -- "${name%/}"
+    else
+      mkdir -p -- "$(dirname -- "$name")" && touch -- "$name"
+    fi || _pause "Failed to create: $name"
+    continue
+    ;;
+  ctrl-e)
+    ((${#sel[@]} == 1)) || {
+      _pause "Select exactly one item to rename."
+      continue
+    }
+    old="${sel[0]}"
+    read -r -e -i "$old" -p "Rename to: " newname
+    [[ -z "$newname" || "$newname" == "$old" ]] && continue
+    if [[ -e "$newname" ]]; then
+      read -r -p "'$newname' exists. Overwrite? [y/N] " ans
+      [[ "$ans" =~ ^[Yy]$ ]] || continue
+    fi
+    mv -T -- "$old" "$newname" || _pause "Rename failed"
+    continue
+    ;;
+  alt-m | ctrl-w)
+    ((${#sel[@]})) || continue
+    _bulk_rename "${sel[@]}"
+    continue
+    ;;
+  ctrl-k)
+    ((${#sel[@]})) || continue
+    dest=$(_pick_dest)
+    [[ -z "$dest" ]] && continue
+    for f in "${sel[@]}"; do mv -i -- "$f" "$dest/" || _pause "Move failed: $f"; done
+    continue
+    ;;
+  ctrl-p)
+    ((${#sel[@]})) || continue
+    dest=$(_pick_dest)
+    [[ -z "$dest" ]] && continue
+    for f in "${sel[@]}"; do cp -ri -- "$f" "$dest/" || _pause "Copy failed: $f"; done
+    continue
+    ;;
+  ctrl-l)
+    ((${#sel[@]})) || continue
+    read -r -p "Symlink name [default: same name]: " linkname
+    for f in "${sel[@]}"; do
+      target=$(readlink -f -- "$f")
+      lname="${linkname:-$(basename -- "$f")}"
+      if [[ -e "$lname" || -L "$lname" ]]; then
+        _pause "Exists: $lname"
+        continue
+      fi
+      ln -s -- "$target" "$lname" || _pause "Failed: $lname"
+    done
+    continue
+    ;;
+  alt-i)
+    if ((${#sel[@]} == 1)); then
+      f="${sel[0]}"
+      if _have exiftool && file --mime-type -b -- "$f" | grep -q '^image/'; then
+        exiftool -- "$f" | less -R
+      else
+        {
+          stat -- "$f"
+          echo
+          file -- "$f"
+          echo
+          if [[ -f "$f" ]] && file --mime-encoding -b -- "$f" | grep -qv binary; then
+            echo "--- first 40 lines ---"
+            head -n 40 -- "$f"
+          fi
+        } | less -R
+      fi
+      _cleanup_kitty
+    fi
+    continue
+    ;;
+  ctrl-f)
+    if ((${#sel[@]})); then
+      _search_content "${sel[@]}"
+    else
+      _search_content
+    fi
+    continue
+    ;;
+  ctrl-s)
+    case "$SORT_MODE" in
+    name) SORT_MODE=size ;;
+    size) SORT_MODE=mtime ;;
+    mtime) SORT_MODE=ext ;;
+    ext) SORT_MODE=name ;;
+    esac
+    continue
+    ;;
+  ctrl-b)
+    touch "$BOOKMARKS_FILE"
+    _gb '{2}'
+    out=$(
+      {
+        printf '%s|%s\n' "$ADD_LABEL" "$PWD"
+        cat "$BOOKMARKS_FILE"
+      } |
+        FZF_DEFAULT_OPTS='' fzf \
+          --height 60% --layout reverse --border \
+          --prompt 'Bookmark > ' \
+          --delimiter='|' \
+          --expect=ctrl-x \
+          --preview "$RUN --preview {2}" --preview-window 'right:60%:wrap' \
+          "${PREVIEW_BINDS[@]}" \
+          "${GB[@]}" \
+          --header 'Enter: jump or add  Ctrl-X: delete  Esc: cancel'
+    )
+    _cleanup_kitty
+    [[ -z "$out" ]] && continue
+    bkey=$(sed -n 1p <<<"$out")
+    choice=$(sed -n 2p <<<"$out")
+    [[ -z "$choice" ]] && continue
+    bname="${choice%%|*}"
+    target="${choice#*|}"
+    if [[ "$bkey" == "ctrl-x" ]]; then
+      [[ "$bname" == "$ADD_LABEL" ]] || _bm_remove "$bname"
+    elif [[ "$bname" == "$ADD_LABEL" ]]; then
+      read -r -e -i "$(basename "$PWD")" -p "Bookmark name: " bname
+      if [[ -z "$bname" || "$bname" == *'|'* ]]; then
+        _pause "Invalid bookmark name (empty or contains '|')"
+        continue
+      fi
+      _bm_remove "$bname"
+      printf '%s|%s\n' "$bname" "$PWD" >>"$BOOKMARKS_FILE"
+    else
+      _cd "$target" 2>/dev/null || _pause "Not a directory: $target"
+    fi
+    continue
+    ;;
+  ctrl-r)
+    [[ "$MAX_DEPTH" == "1" ]] && MAX_DEPTH=5 || MAX_DEPTH=1
+    continue
+    ;;
+  ctrl-h | alt-.)
+    [[ "$SHOW_HIDDEN" == "1" ]] && SHOW_HIDDEN=0 || SHOW_HIDDEN=1
+    continue
+    ;;
+  ctrl-g)
+    top=$(git rev-parse --show-toplevel 2>/dev/null) ||
+      {
+        _pause "Not a git repository."
+        continue
+      }
+    qtop=$(printf '%q' "$top")
+    git_file=$(
+      {
+        git -C "$top" -c core.quotePath=false diff --name-only
+        git -C "$top" -c core.quotePath=false diff --cached --name-only
+        git -C "$top" -c core.quotePath=false ls-files --others --exclude-standard
+      } | sort -u |
+        while IFS= read -r p; do [[ -e "$top/$p" ]] && printf '%s\n' "$p"; done |
+        FZF_DEFAULT_OPTS='' fzf \
+          --height 70% --layout reverse --border \
+          --preview "cd $qtop && $RUN --preview {}" --preview-window 'right:60%:wrap' \
+          "${PREVIEW_BINDS[@]}" \
+          --header 'Git modified/untracked files  C-v/C-u: scroll preview'
+    )
+    _cleanup_kitty
+    [[ -n "$git_file" ]] && _open_file "$top/$git_file"
+    continue
+    ;;
+  esac
+
+  # -------- Enter --------
+  ((${#all[@]})) || continue
+
+  if ((${#all[@]} == 1)) && [[ "${all[0]}" == ".." ]]; then
+    FOCUS_NAME="${PWD##*/}" # land on the directory we just left
+    _cd .. || break
+  elif ((${#all[@]} == 1)) && [[ -d "${all[0]}" ]]; then
+    _cd "${all[0]}" || break
+  else
+    for f in "${sel[@]}"; do
+      [[ -d "$f" ]] && continue
+      _open_file "$f"
+    done
+  fi
+done
