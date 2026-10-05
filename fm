@@ -60,6 +60,21 @@ mkdir -p "$THUMB_DIR" "$GALLERY_DIR" "$BOOKMARKS_DIR" "$STATE_DIR" "$UNDO_DIR"
 # ==========================================================================
 _have() { command -v "$1" >/dev/null 2>&1; }
 
+# Read at most N NUL-delimited records with GNU or BSD userland.
+_head0() {
+  if head -z -n 0 </dev/null >/dev/null 2>&1; then
+    head -z -n "$1"
+  elif _have ghead && ghead -z -n 0 </dev/null >/dev/null 2>&1; then
+    ghead -z -n "$1"
+  else
+    local record count=0
+    while ((count < $1)) && IFS= read -r -d '' record; do
+      printf '%s\0' "$record"
+      ((++count))
+    done
+  fi
+}
+
 if _have kitten; then
   ICAT=(kitten icat)
 elif _have kitty; then
@@ -1995,7 +2010,7 @@ _prewarm() {
   local workers
   workers=$(_workers)
   xargs -0 -r -n1 -P"$workers" bash "$SELF" --thumb-any \
-    < <(find . -maxdepth 1 -type f "${hid[@]}" "${GALLERY_FIND[@]}" -print0 2>/dev/null | head -z -n 400) \
+    < <(find . -maxdepth 1 -type f "${hid[@]}" "${GALLERY_FIND[@]}" -print0 2>/dev/null | _head0 400) \
     >/dev/null 2>&1 &
   PREWARM_PID=$!
 }
