@@ -1,4 +1,4 @@
-cat > ~/projects/fm/README.md <<'FM_README_END'
+
 
 # fm
 
