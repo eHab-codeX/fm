@@ -1,0 +1,46 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "fm"
+      - ".github/workflows/lint.yml"
+  pull_request:
+    paths:
+      - "fm"
+      - ".github/workflows/lint.yml"
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Syntax check
+        run: bash -n fm
+      - name: Run shellcheck
+        run: shellcheck -x -S warning fm
+
+  syntax-bsd:
+    name: syntax (bsd-style head)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulate BSD head
+        run: |
+          mkdir -p /tmp/fake-head
+          cat > /tmp/fake-head/head <<'SH'
+          #!/bin/sh
+          if [ "$1" = "-z" ]; then
+            echo "head: illegal option -- z" >&2
+            exit 1
+          fi
+          exec /usr/bin/head "$@"
+          SH
+          chmod +x /tmp/fake-head/head
+          echo "/tmp/fake-head" >> "$GITHUB_PATH"
+      - name: Bash syntax
+        run: bash -n fm

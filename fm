@@ -151,7 +151,7 @@ _tilde() {
   if [[ "$p" == "$HOME" ]]; then
     printf '~'
   elif [[ "$p" == "$HOME"/* ]]; then
-    printf '~/%s' "${p#"$HOME"/}"
+    printf '%s/%s' '~' "${p#"$HOME"/}"
   else printf '%s' "$p"; fi
 }
 
@@ -159,7 +159,10 @@ _tilde() {
 # symlinks — `readlink -f` would resolve to the link target).
 _abs_nofollow() {
   local p="${1%/}" d
-  [[ -z "$p" ]] && { printf '/'; return 0; } # "/" itself
+  [[ -z "$p" ]] && {
+    printf '/'
+    return 0
+  } # "/" itself
   [[ "$p" == */* ]] || p="./$p"
   d="${p%/*}"
   [[ -z "$d" ]] && d="/" # top-level absolute path such as /foo
@@ -1814,7 +1817,7 @@ case "${1:-}" in
       fi
     fi
   fi
-  if ((!ok)); then
+  if ((! ok)); then
     _have xdg-open && setsid -f xdg-open "$p" >/dev/null 2>&1
   fi
   exit 0
