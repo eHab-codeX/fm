@@ -1,3 +1,5 @@
+cat > ~/projects/fm/README.md <<'FM_README_END'
+
 # fm
 
 > A keyboard-driven terminal file manager built on `fzf`, `eza`, and Kitty's
@@ -5,8 +7,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Bash 5+](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](#requirements)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](#platform-support)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+[![lint](https://github.com/eHab-codeX/fm/actions/workflows/lint.yml/badge.svg)](https://github.com/eHab-codeX/fm/actions/workflows/lint.yml)
 
 ![fm demo](docs/demo.gif)
 
@@ -29,6 +32,46 @@
 
     git clone https://github.com/eHab-codeX/fm.git ~/.local/share/fm
     ln -sf ~/.local/share/fm/fm ~/.local/bin/fm
+
+### Requirements
+
+| Dep                            | Purpose                          | Required    |
+| ------------------------------ | -------------------------------- | ----------- |
+| `bash` >= 5                    | Uses `EPOCHREALTIME`, `${var,,}` | ✅          |
+| `fzf`                          | The picker itself                | ✅          |
+| `eza`                          | Icons + colored listing          | ✅          |
+| `ripgrep`                      | `Ctrl-F` content search          | ✅          |
+| `trash-cli`                    | `Ctrl-D` / undo stack            | ✅          |
+| `kitty` + `kitten`             | Inline previews, gallery grid    | recommended |
+| `bat`                          | Syntax highlighting              | recommended |
+| `imagemagick`                  | Contact sheets, MD → PNG         | recommended |
+| `fd`                           | Faster file discovery            | optional    |
+| `pdftoppm` (poppler)           | PDF thumbnails                   | optional    |
+| `ffmpeg` / `ffmpegthumbnailer` | Video thumbnails                 | optional    |
+| `glow` or `mdcat`              | Rendered Markdown previews       | optional    |
+| `zoxide`                       | `Alt-Z` frecency jump            | optional    |
+
+Arch one-liner:
+
+    sudo pacman -S fzf eza ripgrep trash-cli bat imagemagick fd poppler ffmpegthumbnailer glow zoxide
+
+### Platform support
+
+Primary target is Linux. `fm` also runs on macOS and the BSDs, but a few
+helpers prefer GNU coreutils. Where GNU-only flags are used, `fm` falls
+back to a portable implementation — the thumbnail prewarming path, for
+example, tries GNU `head`, then `ghead`, then pure Bash.
+
+On macOS:
+
+    brew install bash fzf eza ripgrep trash coreutils fd poppler imagemagick ffmpeg glow zoxide
+
+On FreeBSD:
+
+    pkg install bash fzf eza ripgrep trash-cli coreutils fd-find poppler-utils ImageMagick7 ffmpeg glow zoxide
+
+The Bash fallbacks mean `fm` still works if you skip `coreutils`, at the
+cost of slightly slower prewarming.
 
 ## Keybindings
 
@@ -142,42 +185,15 @@ standard terminal; some mouse actions require Kitty.
 > it for editing the query. Use the `..` entry, or <kbd>Backspace</kbd> in
 > the gallery grid.
 
-### Requirements
+## Contributing
 
-| Dep                            | Purpose                          | Required    |
-| ------------------------------ | -------------------------------- | ----------- |
-| `bash` >= 5                    | Uses `EPOCHREALTIME`, `${var,,}` | ✅          |
-| `fzf`                          | The picker itself                | ✅          |
-| `eza`                          | Icons + colored listing          | ✅          |
-| `ripgrep`                      | `Ctrl-F` content search          | ✅          |
-| `trash-cli`                    | `Ctrl-D` / undo stack            | ✅          |
-| `kitty` + `kitten`             | Inline previews, gallery grid    | recommended |
-| `bat`                          | Syntax highlighting              | recommended |
-| `imagemagick`                  | Contact sheets, MD → PNG         | recommended |
-| `fd`                           | Faster file discovery            | optional    |
-| `pdftoppm` (poppler)           | PDF thumbnails                   | optional    |
-| `ffmpeg` / `ffmpegthumbnailer` | Video thumbnails                 | optional    |
-| `glow` or `mdcat`              | Rendered Markdown previews       | optional    |
-| `zoxide`                       | `Alt-Z` frecency jump            | optional    |
+Issues and PRs welcome. Before opening a PR:
 
-Arch one-liner:
+1. Run `shellcheck fm` — CI does too.
+2. Keep changes to the existing style (2-space indent, `_helper_name` for internal functions).
+3. Test on Bash 5+.
 
-    sudo pacman -S fzf eza ripgrep trash-cli bat imagemagick fd poppler ffmpegthumbnailer glow zoxide
+## License
 
-### Platform support
-
-Primary target is Linux. `fm` also runs on macOS and the BSDs, but a few
-helpers prefer GNU coreutils. Where GNU-only flags are used, `fm` falls
-back to a portable implementation — the thumbnail prewarming path, for
-example, tries GNU `head`, then `ghead`, then pure Bash.
-
-On macOS:
-
-    brew install bash fzf eza ripgrep trash coreutils fd poppler imagemagick ffmpeg glow zoxide
-
-On FreeBSD:
-
-    pkg install bash fzf eza ripgrep trash-cli coreutils fd-find poppler-utils ImageMagick7 ffmpeg glow zoxide
-
-The Bash fallbacks mean `fm` still works if you skip `coreutils`, at the
-cost of slightly slower prewarming.
+MIT © eHab-codeX
+FM_README_END
